@@ -24,7 +24,7 @@ Scheduling and running DAGs is a common problem and I didn't find any prior art.
 * As the render graph in [`renderling`](https://github.com/schell/renderling), a scrappy real-time renderer with advanced lighting
 * Its scheduler is used for scheduling systems in [`apecs`](https://github.com/schell/apecs), a well-performing ECS with async integration.
 
-## :heart: Sponsor this!
+## 💚 Sponsor this!
 
 This work will always be free and open source. If you use it (outright or for inspiration), please consider donating.
 
