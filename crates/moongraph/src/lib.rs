@@ -1,4 +1,11 @@
-//! Render graph
+//! DAG scheduling, resource managment, and execution.
+//!
+//! In `moongraph`, nodes are functions with parameters that are accessed
+//! immutably, mutably or by move.
+//!
+//! `moongraph` validates and schedules nodes to run in parallel where possible,
+//! using `rayon` as the underlying parallelizing tech (WIP).
+
 use std::{
     any::Any,
     collections::HashMap,
@@ -14,6 +21,7 @@ pub use broomdog::{TypeKey, TypeMap};
 pub use dagga::{DaggaError, Node};
 pub use moongraph_macros::Edges;
 
+/// All errors.
 #[derive(Debug, Snafu)]
 pub enum GraphError {
     #[snafu(display("Error while running node: {}", error))]
@@ -44,24 +52,36 @@ pub struct Function {
 }
 
 impl Function {
+    /// Run the function using the given `TypeMap`.
     pub fn run(&mut self, resources: &mut TypeMap) -> Result<(), GraphError> {
         (self.inner)(resources)
     }
 }
 
+/// Trait for describing types that are made up of graph edges (ie resources).
+///
+/// Graph edges are the _resources_ that graph nodes (ie functions) consume.
+///
+/// The `Edges` trait allows the library user to construct types that use
+/// resources. This is convenient when the number of resources becomes large
+/// and using a tuple becomes unwieldy.
 pub trait Edges: Sized {
+    /// Keys of all read types used in fields in the implementor.
     fn reads() -> Vec<TypeKey> {
         vec![]
     }
 
+    /// Keys of all write types used in fields in the implementor.
     fn writes() -> Vec<TypeKey> {
         vec![]
     }
 
+    /// Keys of all move types used in fields in the implementor.
     fn moves() -> Vec<TypeKey> {
         vec![]
     }
 
+    /// Attempt to construct the implementor from the given `TypeMap`.
     fn construct(resources: &mut TypeMap) -> Result<Self, GraphError>;
 }
 
@@ -114,8 +134,20 @@ impl_edges!(A, B, C, D, E, F, G, H, I, J);
 impl_edges!(A, B, C, D, E, F, G, H, I, J, K);
 impl_edges!(A, B, C, D, E, F, G, H, I, J, K, L);
 
+/// Trait for describing types that are the result of running a node.
+///
+/// When a node runs it may result in the creation of graph edges (ie
+/// resources). Graph edges are the _resources_ that other nodes (ie functions)
+/// consume.
+///
+/// The `NodeResults` trait allows the library user to emit tuples of resources
+/// that will then be stored in the graph for downstream nodes to use as input.
 pub trait NodeResults {
+    /// All keys of types/resources created.
     fn creates() -> Vec<TypeKey>;
+
+    /// Attempt to pack the implementor's constituent resources into the given
+    /// `TypeMap`.
     fn save(self, resources: &mut TypeMap) -> Result<(), GraphError>;
 }
 
@@ -212,11 +244,25 @@ impl_node_results!(
     (L, 11)
 );
 
-/// Defines render graph nodes.
+/// Defines graph nodes.
 ///
-/// A node in the render graph is a function that may create, consume, read or
-/// write resources.
+/// A node in the graph is a boxed Rust closure that may do any or all the
+/// following:
+///
+/// * Create resources by returning a result that implements [`NodeResults`].
+/// * Consume one or more resources by having a field in the input parameter
+///   wrapped in [`Move`]. The resource will not be available in the graph after
+///   the node is run.
+/// * Read one or more resources by having a field in the input parameter
+///   wrapped in [`Read`].
+/// * Write one or more resources by having a field in the input parameter
+///   wrapped in [`Write`].
+///
+/// By default `IsGraphNode` is implemented for functions that take one
+/// parameter implementing [`Edges`] and returning a `Result` where the "ok"
+/// type implements `NodeResults`.
 pub trait IsGraphNode<Input, Output> {
+    /// Convert the implementor into a `Node`.
     fn into_node(self) -> Node<Function, TypeKey>;
 }
 
@@ -247,6 +293,7 @@ impl<
     }
 }
 
+/// Specifies a graph edge/resource that is "moved" by a node.
 pub struct Move<T> {
     inner: T,
 }
@@ -269,6 +316,7 @@ impl<T: Any + Send + Sync> Edges for Move<T> {
 }
 
 impl<T> Move<T> {
+    /// Convert into its inner type.
     pub fn into(self) -> T {
         self.inner
     }
@@ -288,6 +336,7 @@ impl<T> DerefMut for Move<T> {
     }
 }
 
+/// Specifies a graph edge/resource that is "read" from by a node.
 pub struct Read<T> {
     inner: Loan,
     _phantom: PhantomData<T>,
@@ -322,6 +371,7 @@ impl<T: Any + Send + Sync> Edges for Read<T> {
     }
 }
 
+/// Specifies a graph edge/resource that is "written" to by a node.
 pub struct Write<T> {
     inner: LoanMut,
     _phantom: PhantomData<T>,
@@ -363,6 +413,17 @@ impl<'a, T: Any + Send + Sync> Edges for Write<T> {
     }
 }
 
+/// An acyclic, directed graph made up of nodes/functions and edges/resources.
+///
+/// Notably nodes may have additional run requirements added to them besides
+/// input/output requirements. These include:
+///
+/// * barriers
+/// * run before node
+/// * run after node
+///
+/// See the module documentation for [`Node`] for more info on constructing
+/// nodes with granular constraints.
 #[derive(Default)]
 pub struct Graph {
     resources: TypeMap,
@@ -416,13 +477,15 @@ impl Graph {
         let dag = all_nodes
             .into_iter()
             .fold(Dag::default(), |dag, node| dag.with_node(node));
-        let schedule = dag.build_schedule().map_err(|dagga::BuildScheduleError{ source, mut dag }| {
-            // we have to put the nodes back so the library user can do debugging
-            for node in dag.take_nodes() {
-                self.add_node(node);
-            }
-            GraphError::Scheduling { source }
-        })?;
+        let schedule =
+            dag.build_schedule()
+                .map_err(|dagga::BuildScheduleError { source, mut dag }| {
+                    // we have to put the nodes back so the library user can do debugging
+                    for node in dag.take_nodes() {
+                        self.add_node(node);
+                    }
+                    GraphError::Scheduling { source }
+                })?;
         log::trace!("{:#?}", schedule.batched_names());
         self.schedule = schedule.batches;
         Ok(())
@@ -584,7 +647,7 @@ impl Graph {
         Ok(self.resources.get_value_mut().context(ResourceSnafu)?)
     }
 
-    /// Fetch a loanable type and visit it with a closure.
+    /// Fetch graph edges and visit them with a closure.
     ///
     /// This is like running a one-off graph node, but `S` does not get packed
     /// into the graph as a result resource, instead it is given back to the
@@ -592,9 +655,9 @@ impl Graph {
     ///
     /// ## Note
     /// By design, visiting the graph with a type that uses `Move` in one of its
-    /// fields will result in the type of that field being `move`d **out**
-    /// of the graph. The resource will no longer be available within the
-    /// graph.
+    /// fields will result in the wrapped type of that field being `move`d
+    /// **out** of the graph. The resource will no longer be available
+    /// within the graph.
     ///
     /// ```rust
     /// use moongraph::*;
@@ -640,12 +703,12 @@ impl Graph {
     }
 
     #[cfg(feature = "dot")]
+    /// Save the graph to the filesystem as a dot file to be visualized with graphiz (or similar).
     pub fn save_graph_dot(&self, path: &str) {
         use dagga::dot::DagLegend;
 
-        let legend = DagLegend::new(self.nodes()).with_resources_named(|ty: &TypeKey| {
-            ty.name().to_string()
-        });
+        let legend =
+            DagLegend::new(self.nodes()).with_resources_named(|ty: &TypeKey| ty.name().to_string());
         legend.save_to(path).unwrap();
     }
 }
