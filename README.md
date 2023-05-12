@@ -2,7 +2,9 @@
 
 `moongraph` is a Rust library for scheduling, managing resources, and running directed acyclic graphs.
 
-In a `moongraph`, nodes are functions with parameters that are accessed immutably, mutably or by move.
+In `moongraph`, graph nodes are normal Rust functions and graph edges are function parameters and function results. 
+
+The graph is built automatically by registering each function. `moongraph` figures out how the functions connect by their paramaters and their results.  
 
 `moongraph` validates and schedules nodes to run in parallel where possible, using `rayon` as the underlying parallelizing tech (WIP).
 
