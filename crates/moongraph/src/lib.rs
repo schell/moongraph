@@ -29,6 +29,9 @@ pub enum GraphError {
         error: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
 
+    #[snafu(display("Error while running local node {error}"))]
+    RunningLocalNode { error: String },
+
     #[snafu(display("Error scheduling the graph: {source}"))]
     Scheduling { source: dagga::DaggaError },
 
@@ -40,6 +43,9 @@ pub enum GraphError {
 
     #[snafu(display("Missing resource '{name}'"))]
     Missing { name: &'static str },
+
+    #[snafu(display("Encountered local function that was not provided or already run"))]
+    MissingLocal,
 }
 
 /// A function wrapper.
@@ -48,14 +54,29 @@ pub enum GraphError {
 /// of the function are constructed from a TypeMap of resources, and the results
 /// of the function are packed back into the same TypeMap.
 pub struct Function {
-    inner: Box<dyn Fn(&mut TypeMap) -> Result<(), GraphError>>,
+    prepare: Box<dyn Fn(&mut TypeMap) -> Result<Box<dyn Any>, GraphError>>,
+    run: Option<Box<dyn Fn(Box<dyn Any>) -> Result<Box<dyn Any>, GraphError>>>,
+    save: Box<dyn Fn(Box<dyn Any>, &mut TypeMap) -> Result<(), GraphError>>
 }
 
 impl Function {
     /// Run the function using the given `TypeMap`.
-    pub fn run(&mut self, resources: &mut TypeMap) -> Result<(), GraphError> {
-        (self.inner)(resources)
+    pub fn run(
+        &mut self,
+        resources: Box<dyn Any>,
+        local: &mut Option<impl FnOnce(Box<dyn Any>) -> Result<Box<dyn Any>, GraphError>>,
+    ) -> Result<Box<dyn Any>, GraphError> {
+        if let Some(f) = self.run.as_ref() {
+            (f)(resources)
+        } else {
+            let local = local.take().context(MissingLocalSnafu)?;
+            (local)(resources)
+        }
     }
+}
+
+fn missing_local(_: ()) -> Result<(), GraphError> {
+    Err(GraphError::MissingLocal)
 }
 
 /// Trait for describing types that are made up of graph edges (ie resources).
@@ -244,6 +265,16 @@ impl_node_results!(
     (L, 11)
 );
 
+fn prepare<Input: Edges + Any>(resources: &mut TypeMap) -> Result<Box<dyn Any>, GraphError> {
+    let input = Input::construct(resources)?;
+    Ok(Box::new(input))
+}
+
+fn save<Output: NodeResults + Any>(creates: Box<dyn Any>, resources: &mut TypeMap) -> Result<(), GraphError> {
+    let creates = *creates.downcast::<Output>().unwrap();
+    creates.save(resources)
+}
+
 /// Defines graph nodes.
 ///
 /// A node in the graph is a boxed Rust closure that may do any or all the
@@ -267,25 +298,26 @@ pub trait IsGraphNode<Input, Output> {
 }
 
 impl<
-        Input: Edges,
-        Output: NodeResults,
+        Input: Edges + Any,
+        Output: NodeResults + Any,
         F: Fn(Input) -> Result<Output, E> + 'static,
         E: std::error::Error + Send + Sync + 'static,
     > IsGraphNode<Input, Output> for F
 {
     fn into_node(self) -> Node<Function, TypeKey> {
-        let inner = Box::new(move |resources: &mut TypeMap| {
-            let input = Input::construct(resources)?;
+        let prepare = Box::new(prepare::<Input>);
+        let save = Box::new(save::<Output>);
+
+        let inner = Box::new(move |resources: Box<dyn Any>| -> Result<Box<dyn Any>, GraphError>{
+            let input = *resources.downcast::<Input>().unwrap();
             match (self)(input) {
                 Ok(creates) => {
-                    resources.unify().context(ResourceSnafu)?;
-                    creates.save(resources)?;
-                    Ok(())
+                    Ok(Box::new(creates))
                 }
                 Err(e) => Err(GraphError::RunningNode { error: Box::new(e) }),
             }
         });
-        Node::new(Function { inner })
+        Node::new(Function { prepare, run: Some(inner), save })
             .with_reads(Input::reads())
             .with_writes(Input::writes())
             .with_moves(Input::moves())
@@ -469,8 +501,10 @@ impl Graph {
             .extend(std::mem::take(&mut self.schedule).into_iter().flatten());
     }
 
-    // Schedule all functions.
-    fn reschedule(&mut self) -> Result<(), GraphError> {
+    /// Reschedule all functions.
+    ///
+    /// If the functions were already scheduled this will unscheduled them first.
+    pub fn reschedule(&mut self) -> Result<(), GraphError> {
         log::trace!("rescheduling the render graph:");
         self.unschedule();
         let all_nodes = std::mem::take(&mut self.unscheduled);
@@ -486,9 +520,17 @@ impl Graph {
                     }
                     GraphError::Scheduling { source }
                 })?;
-        log::trace!("{:#?}", schedule.batched_names());
+        let batched_names = schedule.batched_names();
+        log::trace!("{:#?}", batched_names);
         self.schedule = schedule.batches;
         Ok(())
+    }
+
+    pub fn get_schedule(&self) -> Vec<Vec<&str>> {
+        self.schedule
+            .iter()
+            .map(|batch| batch.iter().map(|node| node.name()).collect())
+            .collect()
     }
 
     /// An iterator over all nodes.
@@ -609,15 +651,81 @@ impl Graph {
 
     /// Run the graph.
     pub fn run(&mut self) -> Result<(), GraphError> {
+        self.run_with_local(missing_local)
+    }
+
+    /// Add a locally run function to the graph.
+    ///
+    /// There may be only one locally run function.
+    ///
+    /// If a graph contains a local function the graph _MUST_ be run with
+    /// [`Graph::run_with_local`].
+    pub fn add_local<Input, Output>(&mut self)
+    where
+        Input: Edges + Any,
+        Output: NodeResults + Any,
+    {
+        self.add_node(
+            Node::new(Function {
+                prepare: Box::new(prepare::<Input>),
+                run: None,
+                save: Box::new(save::<Output>)
+            })
+                .with_name("local")
+                .with_reads(Input::reads())
+                .with_writes(Input::writes())
+                .with_moves(Input::moves())
+                .with_results(Output::creates()),
+        );
+    }
+
+    pub fn with_local<Input, Output>(mut self) -> Self
+    where
+        Input: Edges + Any,
+        Output: NodeResults + Any,
+    {
+        self.add_local::<Input, Output>();
+        self
+    }
+
+    pub fn run_with_local<Input, Output, E>(
+        &mut self,
+        f: impl FnOnce(Input) -> Result<Output, E>,
+    ) -> Result<(), GraphError>
+    where
+        Input: Edges + Any,
+        Output: NodeResults + Any,
+        E: ToString,
+    {
+        let mut local = Some(move |resources: Box<dyn Any>| {
+            let input = *resources.downcast::<Input>().unwrap();
+            match (f)(input) {
+                Ok(creates) => {
+                    Ok(Box::new(creates) as Box<dyn Any>)
+                }
+                Err(e) => Err(GraphError::RunningLocalNode {
+                    error: e.to_string(),
+                }),
+            }
+        });
+
         if !self.unscheduled.is_empty() {
             self.reschedule()?;
         }
 
-        // TODO: run batches concurrently
+        // TODO: update dagga to support locals, then use rayon
         for batch in self.schedule.iter_mut() {
             for node in batch.iter_mut() {
-                node.inner_mut().run(&mut self.resources)?;
+                let input = (node.inner().prepare)(&mut self.resources)?;
+                let output = if let Some(f) = node.inner_mut().run.as_ref() {
+                    (f)(input)?
+                } else {
+                    let f = local.take().context(MissingLocalSnafu)?;
+                    (f)(input)?
+                };
+                (node.inner().save)(output, &mut self.resources)?;
             }
+            self.resources.unify().context(ResourceSnafu)?;
         }
 
         Ok(())
@@ -802,28 +910,21 @@ mod test {
             .with_function("modify_strings", modify_strings)
             .with_function("end", end);
 
-        graph.run().unwrap();
-        let run_was_all_good = graph.get_resource::<bool>().unwrap().unwrap();
-        assert!(run_was_all_good, "run was not all good");
-
-        // TODO: make (re)scheduling explicit so we can check the schedule before
-        // running
-        let schedule = graph
-            .schedule
-            .iter()
-            .map(|batch| {
-                batch
-                    .iter()
-                    .map(|node| node.name())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .collect::<Vec<_>>();
+        graph.reschedule().unwrap();
+        let schedule = graph.get_schedule();
         assert_eq!(
-            vec!["start", "modify_strings, modify_floats, modify_ints", "end"],
+            vec![
+                vec!["start"],
+                vec!["modify_strings", "modify_floats", "modify_ints"],
+                vec!["end"]
+            ],
             schedule,
             "schedule is wrong"
         );
+
+        graph.run().unwrap();
+        let run_was_all_good = graph.get_resource::<bool>().unwrap().unwrap();
+        assert!(run_was_all_good, "run was not all good");
     }
 
     #[test]
@@ -893,5 +994,90 @@ mod test {
         assert_eq!(0, *graph.get_resource::<usize>().unwrap().unwrap());
         assert_eq!(666.0, *graph.get_resource::<f32>().unwrap().unwrap());
         assert!(!graph.contains_resource::<f64>());
+    }
+
+    #[test]
+    fn can_run_local() {
+        fn start(_: ()) -> Result<(usize, u32, f32, f64, &'static str, String), GraphError> {
+            Ok((0, 0, 0.0, 0.0, "hello", "HELLO".into()))
+        }
+
+        fn modify_ints(
+            (mut numusize, mut numu32): (Write<usize>, Write<u32>),
+        ) -> Result<(), GraphError> {
+            *numusize += 1;
+            *numu32 += 1;
+            Ok(())
+        }
+
+        fn modify_floats(
+            (mut numf32, mut numf64): (Write<f32>, Write<f64>),
+        ) -> Result<(), GraphError> {
+            *numf32 += 10.0;
+            *numf64 += 10.0;
+            Ok(())
+        }
+
+        fn modify_strings(
+            (mut strstatic, mut strowned): (Write<&'static str>, Write<String>),
+        ) -> Result<(), GraphError> {
+            *strstatic = "goodbye";
+            *strowned = "GOODBYE".into();
+            Ok(())
+        }
+
+        fn end(
+            (nusize, nu32, nf32, nf64, sstatic, sowned): (
+                Move<usize>,
+                Move<u32>,
+                Move<f32>,
+                Move<f64>,
+                Move<&'static str>,
+                Move<String>,
+            ),
+        ) -> Result<(bool,), GraphError> {
+            assert_eq!(1, *nusize);
+            assert_eq!(10, *nu32);
+            assert_eq!(100.0, *nf32);
+            assert_eq!(10.0, *nf64);
+            assert_eq!("goodbye", *sstatic);
+            assert_eq!("GOODBYE", *sowned);
+            Ok((true,))
+        }
+
+        let mut graph = Graph::default()
+            .with_function("start", start)
+            .with_function("modify_ints", modify_ints)
+            .with_function("modify_floats", modify_floats)
+            .with_local::<(Write<u32>, Write<f32>), ()>()
+            .with_function("modify_strings", modify_strings)
+            .with_function("end", end);
+
+        graph.reschedule().unwrap();
+        assert_eq!(
+            vec![
+                vec!["start"],
+                vec!["modify_strings", "modify_floats", "modify_ints"],
+                vec!["local"],
+                vec!["end"]
+            ],
+            graph.get_schedule(),
+            "schedule is wrong"
+        );
+
+        let mut my_num = 0.0;
+        graph
+            .run_with_local(
+                |(mut nu32, mut nf32): (Write<u32>, Write<f32>)| -> Result<(), String> {
+                    *nu32 *= 10;
+                    *nf32 *= 10.0;
+                    my_num = *nu32 as f32 + *nf32;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let run_was_all_good = graph.get_resource::<bool>().unwrap().unwrap();
+        assert!(run_was_all_good, "run was not all good");
+        assert_eq!(110.0, my_num, "local did not run");
     }
 }
