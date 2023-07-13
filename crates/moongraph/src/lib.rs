@@ -17,6 +17,9 @@ use broomdog::{Loan, LoanMut};
 use dagga::Dag;
 use snafu::prelude::*;
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 pub use broomdog::{TypeKey, TypeMap};
 pub use dagga::{DaggaError, Node};
 pub use moongraph_macros::Edges;
@@ -48,24 +51,26 @@ pub enum GraphError {
     MissingLocal,
 }
 
+type Resource = Box<dyn Any + Send + Sync>;
+
 /// A function wrapper.
 ///
 /// Wraps a function by moving it into a closure. Before running the parameters
 /// of the function are constructed from a TypeMap of resources, and the results
 /// of the function are packed back into the same TypeMap.
 pub struct Function {
-    prepare: Box<dyn Fn(&mut TypeMap) -> Result<Box<dyn Any>, GraphError>>,
-    run: Option<Box<dyn Fn(Box<dyn Any>) -> Result<Box<dyn Any>, GraphError>>>,
-    save: Box<dyn Fn(Box<dyn Any>, &mut TypeMap) -> Result<(), GraphError>>
+    prepare: Box<dyn Fn(&mut TypeMap) -> Result<Resource, GraphError>>,
+    run: Option<Box<dyn Fn(Resource) -> Result<Resource, GraphError> + Send + Sync>>,
+    save: Box<dyn Fn(Resource, &mut TypeMap) -> Result<(), GraphError>>,
 }
 
 impl Function {
     /// Run the function using the given `TypeMap`.
     pub fn run(
         &mut self,
-        resources: Box<dyn Any>,
-        local: &mut Option<impl FnOnce(Box<dyn Any>) -> Result<Box<dyn Any>, GraphError>>,
-    ) -> Result<Box<dyn Any>, GraphError> {
+        resources: Resource,
+        local: &mut Option<impl FnOnce(Resource) -> Result<Resource, GraphError>>,
+    ) -> Result<Resource, GraphError> {
         if let Some(f) = self.run.as_ref() {
             (f)(resources)
         } else {
@@ -265,12 +270,17 @@ impl_node_results!(
     (L, 11)
 );
 
-fn prepare<Input: Edges + Any>(resources: &mut TypeMap) -> Result<Box<dyn Any>, GraphError> {
+fn prepare<Input: Edges + Any + Send + Sync>(
+    resources: &mut TypeMap,
+) -> Result<Resource, GraphError> {
     let input = Input::construct(resources)?;
     Ok(Box::new(input))
 }
 
-fn save<Output: NodeResults + Any>(creates: Box<dyn Any>, resources: &mut TypeMap) -> Result<(), GraphError> {
+fn save<Output: NodeResults + Any + Send + Sync>(
+    creates: Resource,
+    resources: &mut TypeMap,
+) -> Result<(), GraphError> {
     let creates = *creates.downcast::<Output>().unwrap();
     creates.save(resources)
 }
@@ -298,9 +308,9 @@ pub trait IsGraphNode<Input, Output> {
 }
 
 impl<
-        Input: Edges + Any,
-        Output: NodeResults + Any,
-        F: Fn(Input) -> Result<Output, E> + 'static,
+        Input: Edges + Any + Send + Sync,
+        Output: NodeResults + Any + Send + Sync,
+        F: Fn(Input) -> Result<Output, E> + Send + Sync + 'static,
         E: std::error::Error + Send + Sync + 'static,
     > IsGraphNode<Input, Output> for F
 {
@@ -308,20 +318,22 @@ impl<
         let prepare = Box::new(prepare::<Input>);
         let save = Box::new(save::<Output>);
 
-        let inner = Box::new(move |resources: Box<dyn Any>| -> Result<Box<dyn Any>, GraphError>{
+        let inner = Box::new(move |resources: Resource| -> Result<Resource, GraphError> {
             let input = *resources.downcast::<Input>().unwrap();
             match (self)(input) {
-                Ok(creates) => {
-                    Ok(Box::new(creates))
-                }
+                Ok(creates) => Ok(Box::new(creates)),
                 Err(e) => Err(GraphError::RunningNode { error: Box::new(e) }),
             }
         });
-        Node::new(Function { prepare, run: Some(inner), save })
-            .with_reads(Input::reads())
-            .with_writes(Input::writes())
-            .with_moves(Input::moves())
-            .with_results(Output::creates())
+        Node::new(Function {
+            prepare,
+            run: Some(inner),
+            save,
+        })
+        .with_reads(Input::reads())
+        .with_writes(Input::writes())
+        .with_moves(Input::moves())
+        .with_results(Output::creates())
     }
 }
 
@@ -368,13 +380,13 @@ impl<T> DerefMut for Move<T> {
     }
 }
 
-/// Specifies a graph edge/resource that is "read" from by a node.
-pub struct Read<T> {
+/// Specifies a graph edge/resource that can be "read" by a node.
+pub struct View<T> {
     inner: Loan,
     _phantom: PhantomData<T>,
 }
 
-impl<T: Any + Send + Sync> Deref for Read<T> {
+impl<T: Any + Send + Sync> Deref for View<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -383,7 +395,7 @@ impl<T: Any + Send + Sync> Deref for Read<T> {
     }
 }
 
-impl<T: Any + Send + Sync> Edges for Read<T> {
+impl<T: Any + Send + Sync> Edges for View<T> {
     fn reads() -> Vec<TypeKey> {
         vec![TypeKey::new::<T>()]
     }
@@ -396,20 +408,20 @@ impl<T: Any + Send + Sync> Edges for Read<T> {
             .context(MissingSnafu {
                 name: std::any::type_name::<T>(),
             })?;
-        Ok(Read {
+        Ok(View {
             inner,
             _phantom: PhantomData,
         })
     }
 }
 
-/// Specifies a graph edge/resource that is "written" to by a node.
-pub struct Write<T> {
+/// Specifies a graph edge/resource that can be "written" to by a node.
+pub struct ViewMut<T> {
     inner: LoanMut,
     _phantom: PhantomData<T>,
 }
 
-impl<T: Any + Send + Sync> Deref for Write<T> {
+impl<T: Any + Send + Sync> Deref for ViewMut<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -418,14 +430,14 @@ impl<T: Any + Send + Sync> Deref for Write<T> {
     }
 }
 
-impl<T: Any + Send + Sync> DerefMut for Write<T> {
+impl<T: Any + Send + Sync> DerefMut for ViewMut<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         // UNWRAP: safe because it was constructed with `T`
         self.inner.downcast_mut().unwrap()
     }
 }
 
-impl<'a, T: Any + Send + Sync> Edges for Write<T> {
+impl<'a, T: Any + Send + Sync> Edges for ViewMut<T> {
     fn writes() -> Vec<TypeKey> {
         vec![TypeKey::new::<T>()]
     }
@@ -438,7 +450,7 @@ impl<'a, T: Any + Send + Sync> Edges for Write<T> {
             .context(MissingSnafu {
                 name: std::any::type_name::<T>(),
             })?;
-        Ok(Write {
+        Ok(ViewMut {
             inner,
             _phantom: PhantomData,
         })
@@ -503,7 +515,8 @@ impl Graph {
 
     /// Reschedule all functions.
     ///
-    /// If the functions were already scheduled this will unscheduled them first.
+    /// If the functions were already scheduled this will unscheduled them
+    /// first.
     pub fn reschedule(&mut self) -> Result<(), GraphError> {
         log::trace!("rescheduling the render graph:");
         self.unschedule();
@@ -649,60 +662,60 @@ impl Graph {
         self
     }
 
-    /// Run the graph.
-    pub fn run(&mut self) -> Result<(), GraphError> {
-        self.run_with_local(missing_local)
-    }
-
-    /// Add a locally run function to the graph.
+    /// Add a locally run function to the graph by adding its name, input and
+    /// output params.
     ///
     /// There may be only one locally run function.
     ///
     /// If a graph contains a local function the graph _MUST_ be run with
     /// [`Graph::run_with_local`].
-    pub fn add_local<Input, Output>(&mut self)
+    pub fn add_local<Input, Output>(&mut self, name: impl Into<String>)
     where
-        Input: Edges + Any,
-        Output: NodeResults + Any,
+        Input: Edges + Any + Send + Sync,
+        Output: NodeResults + Any + Send + Sync,
     {
         self.add_node(
             Node::new(Function {
                 prepare: Box::new(prepare::<Input>),
                 run: None,
-                save: Box::new(save::<Output>)
+                save: Box::new(save::<Output>),
             })
-                .with_name("local")
-                .with_reads(Input::reads())
-                .with_writes(Input::writes())
-                .with_moves(Input::moves())
-                .with_results(Output::creates()),
+            .with_name(name)
+            .with_reads(Input::reads())
+            .with_writes(Input::writes())
+            .with_moves(Input::moves())
+            .with_results(Output::creates()),
         );
     }
 
-    pub fn with_local<Input, Output>(mut self) -> Self
+    pub fn with_local<Input, Output>(mut self, name: impl Into<String>) -> Self
     where
-        Input: Edges + Any,
-        Output: NodeResults + Any,
+        Input: Edges + Any + Send + Sync,
+        Output: NodeResults + Any + Send + Sync,
     {
-        self.add_local::<Input, Output>();
+        self.add_local::<Input, Output>(name);
         self
     }
 
+    /// Run the graph.
+    pub fn run(&mut self) -> Result<(), GraphError> {
+        self.run_with_local(missing_local)
+    }
+
+    /// Run the graph with the given local function.
     pub fn run_with_local<Input, Output, E>(
         &mut self,
         f: impl FnOnce(Input) -> Result<Output, E>,
     ) -> Result<(), GraphError>
     where
-        Input: Edges + Any,
-        Output: NodeResults + Any,
+        Input: Edges + Any + Send + Sync,
+        Output: NodeResults + Any + Send + Sync,
         E: ToString,
     {
-        let mut local = Some(move |resources: Box<dyn Any>| {
+        let mut local = Some(move |resources: Resource| {
             let input = *resources.downcast::<Input>().unwrap();
             match (f)(input) {
-                Ok(creates) => {
-                    Ok(Box::new(creates) as Box<dyn Any>)
-                }
+                Ok(creates) => Ok(Box::new(creates) as Resource),
                 Err(e) => Err(GraphError::RunningLocalNode {
                     error: e.to_string(),
                 }),
@@ -713,18 +726,75 @@ impl Graph {
             self.reschedule()?;
         }
 
-        // TODO: update dagga to support locals, then use rayon
-        for batch in self.schedule.iter_mut() {
-            for node in batch.iter_mut() {
+        #[derive(Default)]
+        struct Batch<'a, 'b> {
+            inputs: Vec<Resource>,
+            runs: Vec<&'a Box<dyn Fn(Resource) -> Result<Resource, GraphError> + Send + Sync>>,
+            local: Option<(
+                Resource,
+                Box<dyn FnOnce(Resource) -> Result<Resource, GraphError> + 'b>,
+            )>,
+        }
+
+        impl<'a, 'b> Batch<'a, 'b> {
+            #[cfg(feature = "parallel")]
+            fn run(self) -> Vec<Result<Resource, GraphError>> {
+                let Batch {
+                    inputs,
+                    runs,
+                    local,
+                } = self;
+                let mut outputs = inputs
+                    .into_par_iter()
+                    .zip(runs.into_par_iter())
+                    .map(|(input, f)| (f)(input))
+                    .collect::<Vec<_>>();
+                if let Some((input, f)) = local {
+                    outputs.push((f)(input));
+                }
+                outputs
+            }
+
+            #[cfg(not(feature = "parallel"))]
+            fn run(self) -> Vec<Result<Resource, GraphError>> {
+                let Batch {
+                    inputs,
+                    runs,
+                    local,
+                } = self;
+                let mut outputs = inputs
+                    .into_iter()
+                    .zip(runs.into_iter())
+                    .map(|(input, f)| (f)(input))
+                    .collect::<Vec<_>>();
+                if let Some((input, f)) = local {
+                    outputs.push((f)(input));
+                }
+                outputs
+            }
+        }
+
+        for nodes in self.schedule.iter_mut() {
+            let mut batch = Batch::default();
+            for node in nodes.iter() {
                 let input = (node.inner().prepare)(&mut self.resources)?;
-                let output = if let Some(f) = node.inner_mut().run.as_ref() {
-                    (f)(input)?
+                if let Some(f) = node.inner().run.as_ref() {
+                    batch.inputs.push(input);
+                    batch.runs.push(f);
                 } else {
                     let f = local.take().context(MissingLocalSnafu)?;
-                    (f)(input)?
-                };
+                    batch.local = Some((
+                        input,
+                        Box::new(f) as Box<dyn FnOnce(Resource) -> Result<Resource, GraphError>>,
+                    ));
+                }
+            }
+
+            for (node, output) in nodes.iter().zip(batch.run()) {
+                let output = output?;
                 (node.inner().save)(output, &mut self.resources)?;
             }
+
             self.resources.unify().context(ResourceSnafu)?;
         }
 
@@ -776,8 +846,8 @@ impl Graph {
     ///
     /// #[derive(Edges)]
     /// struct Input {
-    ///     num_usize: Read<usize>,
-    ///     num_f32: Write<f32>,
+    ///     num_usize: View<usize>,
+    ///     num_f32: ViewMut<f32>,
     ///     num_f64: Move<f64>,
     /// }
     ///
@@ -811,7 +881,8 @@ impl Graph {
     }
 
     #[cfg(feature = "dot")]
-    /// Save the graph to the filesystem as a dot file to be visualized with graphiz (or similar).
+    /// Save the graph to the filesystem as a dot file to be visualized with
+    /// graphiz (or similar).
     pub fn save_graph_dot(&self, path: &str) {
         use dagga::dot::DagLegend;
 
@@ -829,7 +900,7 @@ mod test {
         Ok((0,))
     }
 
-    fn edit((mut num,): (Write<usize>,)) -> Result<(), GraphError> {
+    fn edit((mut num,): (ViewMut<usize>,)) -> Result<(), GraphError> {
         *num += 1;
         Ok(())
     }
@@ -861,7 +932,7 @@ mod test {
         }
 
         fn modify_ints(
-            (mut numusize, mut numu32): (Write<usize>, Write<u32>),
+            (mut numusize, mut numu32): (ViewMut<usize>, ViewMut<u32>),
         ) -> Result<(), GraphError> {
             *numusize += 1;
             *numu32 += 1;
@@ -869,7 +940,7 @@ mod test {
         }
 
         fn modify_floats(
-            (mut numf32, mut numf64): (Write<f32>, Write<f64>),
+            (mut numf32, mut numf64): (ViewMut<f32>, ViewMut<f64>),
         ) -> Result<(), GraphError> {
             *numf32 += 10.0;
             *numf64 += 10.0;
@@ -877,7 +948,7 @@ mod test {
         }
 
         fn modify_strings(
-            (mut strstatic, mut strowned): (Write<&'static str>, Write<String>),
+            (mut strstatic, mut strowned): (ViewMut<&'static str>, ViewMut<String>),
         ) -> Result<(), GraphError> {
             *strstatic = "goodbye";
             *strowned = "GOODBYE".into();
@@ -936,8 +1007,8 @@ mod test {
 
         #[derive(Edges)]
         struct Input {
-            num_usize: Read<usize>,
-            num_f32: Write<f32>,
+            num_usize: View<usize>,
+            num_f32: ViewMut<f32>,
             num_f64: Move<f64>,
         }
 
@@ -974,8 +1045,8 @@ mod test {
 
         #[derive(Edges)]
         struct Input {
-            num_usize: Read<usize>,
-            num_f32: Write<f32>,
+            num_usize: View<usize>,
+            num_f32: ViewMut<f32>,
             num_f64: Move<f64>,
         }
 
@@ -1003,7 +1074,7 @@ mod test {
         }
 
         fn modify_ints(
-            (mut numusize, mut numu32): (Write<usize>, Write<u32>),
+            (mut numusize, mut numu32): (ViewMut<usize>, ViewMut<u32>),
         ) -> Result<(), GraphError> {
             *numusize += 1;
             *numu32 += 1;
@@ -1011,7 +1082,7 @@ mod test {
         }
 
         fn modify_floats(
-            (mut numf32, mut numf64): (Write<f32>, Write<f64>),
+            (mut numf32, mut numf64): (ViewMut<f32>, ViewMut<f64>),
         ) -> Result<(), GraphError> {
             *numf32 += 10.0;
             *numf64 += 10.0;
@@ -1019,7 +1090,7 @@ mod test {
         }
 
         fn modify_strings(
-            (mut strstatic, mut strowned): (Write<&'static str>, Write<String>),
+            (mut strstatic, mut strowned): (ViewMut<&'static str>, ViewMut<String>),
         ) -> Result<(), GraphError> {
             *strstatic = "goodbye";
             *strowned = "GOODBYE".into();
@@ -1049,7 +1120,7 @@ mod test {
             .with_function("start", start)
             .with_function("modify_ints", modify_ints)
             .with_function("modify_floats", modify_floats)
-            .with_local::<(Write<u32>, Write<f32>), ()>()
+            .with_local::<(ViewMut<u32>, ViewMut<f32>), ()>("local")
             .with_function("modify_strings", modify_strings)
             .with_function("end", end);
 
@@ -1068,7 +1139,7 @@ mod test {
         let mut my_num = 0.0;
         graph
             .run_with_local(
-                |(mut nu32, mut nf32): (Write<u32>, Write<f32>)| -> Result<(), String> {
+                |(mut nu32, mut nf32): (ViewMut<u32>, ViewMut<f32>)| -> Result<(), String> {
                     *nu32 *= 10;
                     *nf32 *= 10.0;
                     my_num = *nu32 as f32 + *nf32;
