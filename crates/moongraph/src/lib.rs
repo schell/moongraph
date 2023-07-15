@@ -961,7 +961,7 @@ macro_rules! node {
     };
 }
 
-#[allow(unused_macros)]
+#[macro_export]
 macro_rules! constraint_op {
     (>, $i:ident, $j:ident) => {
         $i.add_runs_after($j)
@@ -972,7 +972,7 @@ macro_rules! constraint_op {
     (,, $i:ident, $j:ident) => {};
 }
 
-#[allow(unused_macros)]
+#[macro_export]
 macro_rules! subgraph {
     ($i:ident $op:tt $($tail:tt)*) => {{
         let (mut g, _tail) = subgraph!($($tail)*);
