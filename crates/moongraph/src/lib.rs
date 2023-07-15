@@ -477,6 +477,7 @@ pub struct Graph {
 }
 
 impl Graph {
+    #[deprecated(since = "0.3.3", note = "Unintuitive implementation. Use Graph::add_subgraph instead.")]
     /// Merge two graphs, preferring the right in cases of key collisions.
     ///
     /// The values of `rhs` will override those of `lhs`.
@@ -505,6 +506,33 @@ impl Graph {
         lhs.unscheduled = unscheduled.into_iter().map(|(_, node)| node).collect();
         lhs.barrier = lhs.barrier.max(rhs.barrier);
         lhs
+    }
+
+    /// Add a subgraph, preferring the right in cases of key collisions.
+    ///
+    /// The values of `rhs` will override those of `self`.
+    ///
+    /// Barriers will be kept in place, though barriers in `rhs` will be
+    /// incremented by `self.barrier`. This has the effect that after adding the subgraph,
+    /// nodes in `rhs` will run after the last barrier in `self`, or later if `rhs` has
+    /// barriers of its own.
+    pub fn add_subgraph(&mut self, mut rhs: Graph) {
+        self.unschedule();
+        rhs.unschedule();
+        let Graph {
+            resources: mut rhs_resources,
+            unscheduled: rhs_nodes,
+            barrier: rhs_barrier,
+            schedule: _,
+        } = rhs;
+        let base_barrier = self.barrier;
+        self.barrier = base_barrier + rhs_barrier;
+        self.resources
+            .extend(std::mem::take(rhs_resources.deref_mut()).into_iter());
+        self.unscheduled.extend(rhs_nodes.into_iter().map(|node| {
+            let barrier = node.get_barrier();
+            node.with_barrier(base_barrier + barrier)
+        }));
     }
 
     /// Unschedule all functions.
@@ -1285,5 +1313,36 @@ mod test {
         g.reschedule().unwrap();
         let schedule = g.get_schedule();
         assert_eq!(vec![vec!["one"], vec!["two"], vec!["three"]], schedule);
+    }
+
+    #[test]
+    fn can_add_subgraph() {
+        fn one(_: ()) -> Result<(), GraphError> {
+            log::trace!("one");
+            Ok(())
+        }
+        fn two(mut an_f32: ViewMut<f32>) -> Result<(), GraphError> {
+            log::trace!("two");
+            *an_f32 += 1.0;
+            Ok(())
+        }
+        fn three(_: ()) -> Result<(), GraphError> {
+            log::trace!("three");
+            Ok(())
+        }
+        fn four(_: ()) -> Result<(), GraphError> {
+            log::trace!("four");
+            Ok(())
+        }
+        let mut one_two = graph!(one < two).with_barrier();
+        assert_eq!(1, one_two.barrier);
+        let three_four = graph!(three < four);
+        assert_eq!(0, three_four.barrier);
+        one_two.add_subgraph(three_four);
+        one_two.reschedule().unwrap();
+        assert_eq!(
+            vec![vec!["one"], vec!["two"], vec!["three"], vec!["four"]],
+            one_two.get_schedule()
+        );
     }
 }
