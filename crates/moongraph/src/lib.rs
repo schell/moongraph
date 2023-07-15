@@ -997,6 +997,8 @@ macro_rules! subgraph {
 #[macro_export]
 macro_rules! graph {
     ($($t:tt)*) => {{
+        #[allow(unused_imports)]
+        use moongraph::{subgraph, constraint_op};
         subgraph!($($t)*).0
     }}
 }
@@ -1004,6 +1006,7 @@ macro_rules! graph {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate as moongraph;
 
     fn create(_: ()) -> Result<(usize,), GraphError> {
         Ok((0,))
@@ -1283,5 +1286,4 @@ mod test {
         let schedule = g.get_schedule();
         assert_eq!(vec![vec!["one"], vec!["two"], vec!["three"]], schedule);
     }
-
 }
