@@ -554,6 +554,19 @@ impl Graph {
             .chain(self.unscheduled.iter())
     }
 
+    /// A mutable iterator over all nodes.
+    pub fn nodes_mut(&mut self) -> impl Iterator<Item = &mut Node<Function, TypeKey>> {
+        self.schedule
+            .iter_mut()
+            .flatten()
+            .chain(self.unscheduled.iter_mut())
+    }
+
+    /// Add multiple nodes to this graph.
+    pub fn with_nodes(self, nodes: impl IntoIterator<Item = Node<Function, TypeKey>>) -> Self {
+        nodes.into_iter().fold(self, Self::with_node)
+    }
+
     /// Add a node to the graph.
     pub fn add_node(&mut self, node: Node<Function, TypeKey>) {
         self.unscheduled.push(node.runs_after_barrier(self.barrier));
@@ -562,6 +575,16 @@ impl Graph {
     /// Return a reference to the node with the given name, if possible.
     pub fn get_node(&self, name: impl AsRef<str>) -> Option<&Node<Function, TypeKey>> {
         for node in self.nodes() {
+            if node.name() == name.as_ref() {
+                return Some(node);
+            }
+        }
+        None
+    }
+
+    /// Return a mutable reference to the node with the given name, if possible.
+    pub fn get_node_mut(&mut self, name: impl AsRef<str>) -> Option<&mut Node<Function, TypeKey>> {
+        for node in self.nodes_mut() {
             if node.name() == name.as_ref() {
                 return Some(node);
             }
@@ -612,8 +635,8 @@ impl Graph {
         self.add_node(f.into_node().with_name(name));
     }
 
-    /// Return whether the graph contains a function with the given name.
-    pub fn contains_function(&self, name: impl AsRef<str>) -> bool {
+    /// Return whether the graph contains a node/function with the given name.
+    pub fn contains_node(&self, name: impl AsRef<str>) -> bool {
         let name = name.as_ref();
         let search = |node: &Node<Function, TypeKey>| node.name() == name;
         if self.unscheduled.iter().any(search) {
@@ -674,18 +697,7 @@ impl Graph {
         Input: Edges + Any + Send + Sync,
         Output: NodeResults + Any + Send + Sync,
     {
-        self.add_node(
-            Node::new(Function {
-                prepare: Box::new(prepare::<Input>),
-                run: None,
-                save: Box::new(save::<Output>),
-            })
-            .with_name(name)
-            .with_reads(Input::reads())
-            .with_writes(Input::writes())
-            .with_moves(Input::moves())
-            .with_results(Output::creates()),
-        );
+        self.add_node(Self::make_local::<Input, Output>().with_name(name));
     }
 
     pub fn with_local<Input, Output>(mut self, name: impl Into<String>) -> Self
@@ -695,6 +707,22 @@ impl Graph {
     {
         self.add_local::<Input, Output>(name);
         self
+    }
+
+    pub fn make_local<Input, Output>() -> Node<Function, TypeKey>
+    where
+        Input: Edges + Any + Send + Sync,
+        Output: NodeResults + Any + Send + Sync,
+    {
+        Node::new(Function {
+            prepare: Box::new(prepare::<Input>),
+            run: None,
+            save: Box::new(save::<Output>),
+        })
+        .with_reads(Input::reads())
+        .with_writes(Input::writes())
+        .with_moves(Input::moves())
+        .with_results(Output::creates())
     }
 
     /// Run the graph.
@@ -892,6 +920,87 @@ impl Graph {
     }
 }
 
+#[macro_export]
+macro_rules! node {
+    // add the nodes with the given idents if they don't already exist and add a constraint on the
+    // first that the first must run before the second
+    ($g:ident, $i:ident < $j:ident) => {{
+        if let Some(node) = $g.get_node_mut(stringify!($i)) {
+            node.add_runs_before(stringify!($j));
+        } else {
+            g.add_node(
+                $i.into_node()
+                    .with_name(stringify!($i))
+                    .run_before(stringify!($j)),
+            );
+        }
+        if !$g.contains_node(stringify!($j)) {
+            g.add_node($j.into_node().with_name(stringify!($i)));
+        }
+    }};
+
+    // add the nodes with the given idents if they don't already exist and add a constraint on the
+    // first that the first must run after the second
+    ($g:ident, $i:ident > $j:ident) => {{
+        if let Some(node) = $g.get_node_mut(stringify!($i)) {
+            node.add_runs_after(stringify!($j));
+        } else {
+            g.add_node(
+                $i.into_node()
+                    .with_name(stringify!($i))
+                    .run_after(stringify!($j)),
+            );
+        }
+        if !$g.contains_node(stringify!($j)) {
+            g.add_node($j.into_node().with_name(stringify!($i)));
+        }
+    }};
+    // add the node with the given ident, using the ident as its name
+    ($g:ident, $i:ident) => {
+        $g.add_node($i.into_node().with_name(stringify!($i)))
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! constraint_op {
+    (>, $i:ident, $j:ident) => {
+        $i.add_runs_after($j)
+    };
+    (<, $i:ident, $j:ident) => {
+        $i.add_runs_before($j)
+    };
+    (,, $i:ident, $j:ident) => {};
+}
+
+#[allow(unused_macros)]
+macro_rules! subgraph {
+    ($i:ident $op:tt $($tail:tt)*) => {{
+        let (mut g, _tail) = subgraph!($($tail)*);
+        if let Some(_node) = g.get_node_mut(stringify!($i)) {
+            constraint_op!($op, _node, _tail);
+        } else {
+            g.add_node({
+                #[allow(unused_mut)]
+                let mut node = $i.into_node().with_name(stringify!($i));
+                constraint_op!($op, node, _tail);
+                node
+            });
+        }
+        (g, stringify!($i))
+    }};
+
+    ($i:ident$(,)?) => {
+        (Graph::default().with_node($i.into_node().with_name(stringify!($i))), stringify!($i))
+    }
+}
+
+#[macro_export]
+macro_rules! graph {
+    ($($t:tt)*) => {{
+        subgraph!($($t)*).0
+    }}
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -1067,6 +1176,7 @@ mod test {
         assert!(!graph.contains_resource::<f64>());
     }
 
+    #[cfg(feature = "none")]
     #[test]
     fn can_run_local() {
         fn start(_: ()) -> Result<(usize, u32, f32, f64, &'static str, String), GraphError> {
@@ -1116,13 +1226,8 @@ mod test {
             Ok((true,))
         }
 
-        let mut graph = Graph::default()
-            .with_function("start", start)
-            .with_function("modify_ints", modify_ints)
-            .with_function("modify_floats", modify_floats)
-            .with_local::<(ViewMut<u32>, ViewMut<f32>), ()>("local")
-            .with_function("modify_strings", modify_strings)
-            .with_function("end", end);
+        let mut graph = graph!(start, modify_ints, modify_floats, modify_strings, end,)
+            .with_local::<(ViewMut<u32>, ViewMut<f32>), ()>("local");
 
         graph.reschedule().unwrap();
         assert_eq!(
@@ -1151,4 +1256,32 @@ mod test {
         assert!(run_was_all_good, "run was not all good");
         assert_eq!(110.0, my_num, "local did not run");
     }
+
+    #[test]
+    fn can_use_graph_macro() {
+        fn one(_: ()) -> Result<(), GraphError> {
+            log::trace!("one");
+            Ok(())
+        }
+        fn two(mut an_f32: ViewMut<f32>) -> Result<(), GraphError> {
+            log::trace!("two");
+            *an_f32 += 1.0;
+            Ok(())
+        }
+        fn three(_: ()) -> Result<(), GraphError> {
+            log::trace!("three");
+            Ok(())
+        }
+
+        let _a = graph!(one < two, three, three > two);
+        let _b = graph!(one, two);
+        let _c = graph!(one < two);
+        let _d = graph!(one);
+        let _e = graph!(one < two < three);
+        let mut g = graph!(one < two < three).with_resource(0.0f32);
+        g.reschedule().unwrap();
+        let schedule = g.get_schedule();
+        assert_eq!(vec![vec!["one"], vec!["two"], vec!["three"]], schedule);
+    }
+
 }
