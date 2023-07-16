@@ -4,7 +4,7 @@
 //! immutably, mutably or by move.
 //!
 //! `moongraph` validates and schedules nodes to run in parallel where possible,
-//! using `rayon` as the underlying parallelizing tech (WIP).
+//! using `rayon` as the underlying parallelizing tech.
 
 use std::{
     any::Any,
@@ -477,12 +477,110 @@ pub struct Graph {
 }
 
 impl Graph {
-    #[deprecated(since = "0.3.3", note = "Unintuitive implementation. Use Graph::add_subgraph instead.")]
+    /// Creates a graph node from an [`Fn`] closure.
+    ///
+    /// A node in the graph is a boxed Rust closure that may do any or all the
+    /// following:
+    ///
+    /// * Create resources by returning a result that implements
+    ///   [`NodeResults`].
+    /// * Consume one or more resources by having a field in the input parameter
+    ///   wrapped in [`Move`]. The resource will not be available in the graph
+    ///   after the node is run.
+    /// * Read one or more resources by having a field in the input parameter
+    ///   wrapped in [`Read`].
+    /// * Write one or more resources by having a field in the input parameter
+    ///   wrapped in [`Write`].
+    ///
+    /// By default `IsGraphNode` is implemented for functions that take one
+    /// parameter implementing [`Edges`] and returning a `Result` where the "ok"
+    /// type implements `NodeResults`.
+    pub fn node<Input, Output, F: IsGraphNode<Input, Output>>(f: F) -> Node<Function, TypeKey> {
+        f.into_node()
+    }
+
+    /// Creates a graph node without a closure, to be supplied later with
+    /// [`Graph::run_with_local`].
+    ///
+    /// The returned node may be added to a graph and scheduled, allowing
+    /// closures with local scope requirements to fit into the graph.
+    ///
+    /// At this time only one local node is allowed.
+    pub fn local<Input, Output>() -> Node<Function, TypeKey>
+    where
+        Input: Edges + Any + Send + Sync,
+        Output: NodeResults + Any + Send + Sync,
+    {
+        Node::new(Function {
+            prepare: Box::new(prepare::<Input>),
+            run: None,
+            save: Box::new(save::<Output>),
+        })
+        .with_reads(Input::reads())
+        .with_writes(Input::writes())
+        .with_moves(Input::moves())
+        .with_results(Output::creates())
+    }
+
+    #[deprecated(
+        since = "0.3.3",
+        note = "Ambiguous name. Replaced by `interleave_subgraph` and `add_subgraph`. Use \
+                Graph::interleave_subgraph instead as a direct replacment."
+    )]
     /// Merge two graphs, preferring the right in cases of key collisions.
     ///
     /// The values of `rhs` will override those of `lhs`.
-    pub fn merge(mut lhs: Graph, mut rhs: Graph) -> Graph {
-        lhs.unschedule();
+    pub fn merge(mut lhs: Graph, rhs: Graph) -> Graph {
+        lhs.interleave_subgraph(rhs);
+        lhs
+    }
+
+    /// Add a subgraph, preferring the right in cases of key collisions.
+    ///
+    /// The values of `rhs` will override those of `self`.
+    ///
+    /// Barriers in each graph will be considered equal. This has the effect
+    /// that after adding the subgraph, nodes in `rhs` may run at the same
+    /// time as nodes in `lhs` if their barrier matches.
+    ///
+    /// This is analogous to adding each graph's nodes in an interleaving order,
+    /// sorted by their barrier.
+    ///
+    /// ## Example:
+    /// ```rust
+    /// use moongraph::{graph, Graph, GraphError, ViewMut};
+    ///
+    /// fn one(_: ()) -> Result<(), GraphError> {
+    ///     log::trace!("one");
+    ///     Ok(())
+    /// }
+    /// fn two(mut an_f32: ViewMut<f32>) -> Result<(), GraphError> {
+    ///     log::trace!("two");
+    ///     *an_f32 += 1.0;
+    ///     Ok(())
+    /// }
+    /// fn three(_: ()) -> Result<(), GraphError> {
+    ///     log::trace!("three");
+    ///     Ok(())
+    /// }
+    /// fn four(_: ()) -> Result<(), GraphError> {
+    ///     log::trace!("four");
+    ///     Ok(())
+    /// }
+    ///
+    /// let mut one_two = graph!(one < two).with_barrier();
+    /// assert_eq!(1, one_two.get_barrier());
+    /// let three_four = graph!(three < four);
+    /// assert_eq!(0, three_four.get_barrier());
+    /// one_two.interleave_subgraph(three_four);
+    /// one_two.reschedule().unwrap();
+    /// assert_eq!(
+    ///     vec![vec!["one", "three"], vec!["four", "two"]],
+    ///     one_two.get_schedule()
+    /// );
+    /// ```
+    pub fn interleave_subgraph(&mut self, mut rhs: Graph) -> &mut Self {
+        self.unschedule();
         rhs.unschedule();
         let Graph {
             resources: mut rhs_resources,
@@ -490,11 +588,12 @@ impl Graph {
             barrier: _,
             schedule: _,
         } = rhs;
-        lhs.resources
+        self.resources
             .extend(std::mem::take(rhs_resources.deref_mut()).into_iter());
         let mut unscheduled: HashMap<String, Node<Function, TypeKey>> = HashMap::default();
+        let lhs_nodes = std::mem::take(&mut self.unscheduled);
         unscheduled.extend(
-            lhs.unscheduled
+            lhs_nodes
                 .into_iter()
                 .map(|node| (node.name().to_string(), node)),
         );
@@ -503,9 +602,9 @@ impl Graph {
                 .into_iter()
                 .map(|node| (node.name().to_string(), node)),
         );
-        lhs.unscheduled = unscheduled.into_iter().map(|(_, node)| node).collect();
-        lhs.barrier = lhs.barrier.max(rhs.barrier);
-        lhs
+        self.unscheduled = unscheduled.into_iter().map(|v| v.1).collect();
+        self.barrier = self.barrier.max(rhs.barrier);
+        self
     }
 
     /// Add a subgraph, preferring the right in cases of key collisions.
@@ -513,10 +612,47 @@ impl Graph {
     /// The values of `rhs` will override those of `self`.
     ///
     /// Barriers will be kept in place, though barriers in `rhs` will be
-    /// incremented by `self.barrier`. This has the effect that after adding the subgraph,
-    /// nodes in `rhs` will run after the last barrier in `self`, or later if `rhs` has
-    /// barriers of its own.
-    pub fn add_subgraph(&mut self, mut rhs: Graph) {
+    /// incremented by `self.barrier`. This has the effect that after adding the
+    /// subgraph, nodes in `rhs` will run after the last barrier in `self`,
+    /// or later if `rhs` has barriers of its own.
+    ///
+    /// This is analogous to adding all of the nodes in `rhs`, one by one, to
+    /// `self` - while keeping the constraints of `rhs` in place.
+    ///
+    /// ## Example:
+    /// ```rust
+    /// use moongraph::{graph, Graph, GraphError, ViewMut};
+    ///
+    /// fn one(_: ()) -> Result<(), GraphError> {
+    ///     log::trace!("one");
+    ///     Ok(())
+    /// }
+    /// fn two(mut an_f32: ViewMut<f32>) -> Result<(), GraphError> {
+    ///     log::trace!("two");
+    ///     *an_f32 += 1.0;
+    ///     Ok(())
+    /// }
+    /// fn three(_: ()) -> Result<(), GraphError> {
+    ///     log::trace!("three");
+    ///     Ok(())
+    /// }
+    /// fn four(_: ()) -> Result<(), GraphError> {
+    ///     log::trace!("four");
+    ///     Ok(())
+    /// }
+    ///
+    /// let mut one_two = graph!(one < two).with_barrier();
+    /// assert_eq!(1, one_two.get_barrier());
+    /// let three_four = graph!(three < four);
+    /// assert_eq!(0, three_four.get_barrier());
+    /// one_two.add_subgraph(three_four);
+    /// one_two.reschedule().unwrap();
+    /// assert_eq!(
+    ///     vec![vec!["one"], vec!["two"], vec!["three"], vec!["four"]],
+    ///     one_two.get_schedule()
+    /// );
+    /// ```
+    pub fn add_subgraph(&mut self, mut rhs: Graph) -> &mut Self {
         self.unschedule();
         rhs.unschedule();
         let Graph {
@@ -533,6 +669,8 @@ impl Graph {
             let barrier = node.get_barrier();
             node.with_barrier(base_barrier + barrier)
         }));
+
+        self
     }
 
     /// Unschedule all functions.
@@ -564,9 +702,19 @@ impl Graph {
         let batched_names = schedule.batched_names();
         log::trace!("{:#?}", batched_names);
         self.schedule = schedule.batches;
+        // Order the nodes in each batch by node name so they are deterministic.
+        for batch in self.schedule.iter_mut() {
+            batch.sort_by(|a, b| a.name().cmp(b.name()));
+        }
         Ok(())
     }
 
+    /// Return the names of scheduled nodes.
+    ///
+    /// If no nodes have been scheduled this will return an empty vector.
+    ///
+    /// Use [`Graph::reschedule`] to manually schedule the nodes before calling
+    /// this.
     pub fn get_schedule(&self) -> Vec<Vec<&str>> {
         self.schedule
             .iter()
@@ -713,6 +861,13 @@ impl Graph {
         self
     }
 
+    /// Return the current barrier.
+    ///
+    /// This will be the barrier for any added nodes.
+    pub fn get_barrier(&self) -> usize {
+        self.barrier
+    }
+
     /// Add a locally run function to the graph by adding its name, input and
     /// output params.
     ///
@@ -725,7 +880,7 @@ impl Graph {
         Input: Edges + Any + Send + Sync,
         Output: NodeResults + Any + Send + Sync,
     {
-        self.add_node(Self::make_local::<Input, Output>().with_name(name));
+        self.add_node(Self::local::<Input, Output>().with_name(name));
     }
 
     pub fn with_local<Input, Output>(mut self, name: impl Into<String>) -> Self
@@ -735,22 +890,6 @@ impl Graph {
     {
         self.add_local::<Input, Output>(name);
         self
-    }
-
-    pub fn make_local<Input, Output>() -> Node<Function, TypeKey>
-    where
-        Input: Edges + Any + Send + Sync,
-        Output: NodeResults + Any + Send + Sync,
-    {
-        Node::new(Function {
-            prepare: Box::new(prepare::<Input>),
-            run: None,
-            save: Box::new(save::<Output>),
-        })
-        .with_reads(Input::reads())
-        .with_writes(Input::writes())
-        .with_moves(Input::moves())
-        .with_results(Output::creates())
     }
 
     /// Run the graph.
@@ -946,95 +1085,87 @@ impl Graph {
             DagLegend::new(self.nodes()).with_resources_named(|ty: &TypeKey| ty.name().to_string());
         legend.save_to(path).unwrap();
     }
-}
 
-#[macro_export]
-macro_rules! node {
-    // add the nodes with the given idents if they don't already exist and add a constraint on the
-    // first that the first must run before the second
-    ($g:ident, $i:ident < $j:ident) => {{
-        if let Some(node) = $g.get_node_mut(stringify!($i)) {
-            node.add_runs_before(stringify!($j));
-        } else {
-            g.add_node(
-                $i.into_node()
-                    .with_name(stringify!($i))
-                    .run_before(stringify!($j)),
-            );
+    /// Internal function used in the [`graph!`] macro.
+    pub fn _add_node_constraint(
+        constraint: &str,
+        i: &mut Node<Function, TypeKey>,
+        j: Option<String>,
+    ) {
+        //
+        match constraint {
+            ">" => {
+                i.add_runs_after(j.unwrap());
+            }
+            "<" => {
+                i.add_runs_before(j.unwrap());
+            }
+            _ => {}
         }
-        if !$g.contains_node(stringify!($j)) {
-            g.add_node($j.into_node().with_name(stringify!($i)));
-        }
-    }};
+    }
 
-    // add the nodes with the given idents if they don't already exist and add a constraint on the
-    // first that the first must run after the second
-    ($g:ident, $i:ident > $j:ident) => {{
-        if let Some(node) = $g.get_node_mut(stringify!($i)) {
-            node.add_runs_after(stringify!($j));
-        } else {
-            g.add_node(
-                $i.into_node()
-                    .with_name(stringify!($i))
-                    .run_after(stringify!($j)),
-            );
-        }
-        if !$g.contains_node(stringify!($j)) {
-            g.add_node($j.into_node().with_name(stringify!($i)));
-        }
-    }};
-    // add the node with the given ident, using the ident as its name
-    ($g:ident, $i:ident) => {
-        $g.add_node($i.into_node().with_name(stringify!($i)))
-    };
-}
-
-#[macro_export]
-macro_rules! constraint_op {
-    (>, $i:ident, $j:ident) => {
-        $i.add_runs_after($j)
-    };
-    (<, $i:ident, $j:ident) => {
-        $i.add_runs_before($j)
-    };
-    (,, $i:ident, $j:ident) => {};
-}
-
-#[macro_export]
-macro_rules! subgraph {
-    ($i:ident $op:tt $($tail:tt)*) => {{
-        let (mut g, _tail) = subgraph!($($tail)*);
-        if let Some(_node) = g.get_node_mut(stringify!($i)) {
-            constraint_op!($op, _node, _tail);
-        } else {
-            g.add_node({
-                #[allow(unused_mut)]
-                let mut node = $i.into_node().with_name(stringify!($i));
-                constraint_op!($op, node, _tail);
-                node
-            });
-        }
-        (g, stringify!($i))
-    }};
-
-    ($i:ident$(,)?) => {
-        (Graph::default().with_node($i.into_node().with_name(stringify!($i))), stringify!($i))
+    pub fn _last_node(&self) -> Option<String> {
+        self.unscheduled.last().map(|node| node.name().to_string())
     }
 }
 
+/// Constructs a [`Graph`] using an intuitive shorthand for node ordering
+/// relationships.
+///
+/// ## Example:
+/// ```rust
+/// use moongraph::{Graph, graph, GraphError, ViewMut};
+///
+/// fn one(_: ()) -> Result<(), GraphError> {
+///     log::trace!("one");
+///     Ok(())
+/// }
+/// fn two(mut an_f32: ViewMut<f32>) -> Result<(), GraphError> {
+///     log::trace!("two");
+///     *an_f32 += 1.0;
+///     Ok(())
+/// }
+/// fn three(_: ()) -> Result<(), GraphError> {
+///     log::trace!("three");
+///     Ok(())
+/// }
+///
+/// let _a = graph!(one < two, three, three > two);
+/// let _b = graph!(one, two);
+/// let _c = graph!(one < two);
+/// let _d = graph!(one);
+/// let _e = graph!(one < two < three);
+///
+/// let mut g = graph!(one < two < three).with_resource(0.0f32);
+/// g.reschedule().unwrap();
+/// let schedule = g.get_schedule();
+/// assert_eq!(vec![vec!["one"], vec!["two"], vec!["three"]], schedule);
+/// ```
 #[macro_export]
 macro_rules! graph {
-    ($($t:tt)*) => {{
-        #[allow(unused_imports)]
-        use moongraph::{subgraph, constraint_op};
-        subgraph!($($t)*).0
-    }}
+    ($i:ident $op:tt $($tail:tt)*) => {{
+        let mut g = graph!($($tail)*);
+        let tail = g._last_node();
+        if let Some(node) = g.get_node_mut(stringify!($i)) {
+            Graph::_add_node_constraint(stringify!($op), node, tail);
+        } else {
+            g.add_node({
+                let mut node = Graph::node($i).with_name(stringify!($i));
+                Graph::_add_node_constraint(stringify!($op), &mut node, tail);
+                node
+            });
+        }
+        g
+    }};
+
+    ($i:ident$(,)?) => {
+        Graph::default().with_node(Graph::node($i).with_name(stringify!($i)))
+    }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate as moongraph;
 
     fn create(_: ()) -> Result<(usize,), GraphError> {
         Ok((0,))
@@ -1126,7 +1257,7 @@ mod test {
         assert_eq!(
             vec![
                 vec!["start"],
-                vec!["modify_strings", "modify_floats", "modify_ints"],
+                vec!["modify_floats", "modify_ints", "modify_strings"],
                 vec!["end"]
             ],
             schedule,
@@ -1286,63 +1417,5 @@ mod test {
         let run_was_all_good = graph.get_resource::<bool>().unwrap().unwrap();
         assert!(run_was_all_good, "run was not all good");
         assert_eq!(110.0, my_num, "local did not run");
-    }
-
-    #[test]
-    fn can_use_graph_macro() {
-        fn one(_: ()) -> Result<(), GraphError> {
-            log::trace!("one");
-            Ok(())
-        }
-        fn two(mut an_f32: ViewMut<f32>) -> Result<(), GraphError> {
-            log::trace!("two");
-            *an_f32 += 1.0;
-            Ok(())
-        }
-        fn three(_: ()) -> Result<(), GraphError> {
-            log::trace!("three");
-            Ok(())
-        }
-
-        let _a = graph!(one < two, three, three > two);
-        let _b = graph!(one, two);
-        let _c = graph!(one < two);
-        let _d = graph!(one);
-        let _e = graph!(one < two < three);
-        let mut g = graph!(one < two < three).with_resource(0.0f32);
-        g.reschedule().unwrap();
-        let schedule = g.get_schedule();
-        assert_eq!(vec![vec!["one"], vec!["two"], vec!["three"]], schedule);
-    }
-
-    #[test]
-    fn can_add_subgraph() {
-        fn one(_: ()) -> Result<(), GraphError> {
-            log::trace!("one");
-            Ok(())
-        }
-        fn two(mut an_f32: ViewMut<f32>) -> Result<(), GraphError> {
-            log::trace!("two");
-            *an_f32 += 1.0;
-            Ok(())
-        }
-        fn three(_: ()) -> Result<(), GraphError> {
-            log::trace!("three");
-            Ok(())
-        }
-        fn four(_: ()) -> Result<(), GraphError> {
-            log::trace!("four");
-            Ok(())
-        }
-        let mut one_two = graph!(one < two).with_barrier();
-        assert_eq!(1, one_two.barrier);
-        let three_four = graph!(three < four);
-        assert_eq!(0, three_four.barrier);
-        one_two.add_subgraph(three_four);
-        one_two.reschedule().unwrap();
-        assert_eq!(
-            vec![vec!["one"], vec!["two"], vec!["three"], vec!["four"]],
-            one_two.get_schedule()
-        );
     }
 }

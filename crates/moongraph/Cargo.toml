@@ -1,6 +1,6 @@
 [package]
 name = "moongraph"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 description = "Schedules and runs DAGs accessing shared resources. 🌙"
 repository = "https://github.com/schell/moongraph"
@@ -20,6 +20,6 @@ dot = ["dagga/dot"]
 broomdog = "^0.1"
 dagga = { version = "^0.2.1", default-features = false }
 log = "0.4.17"
-moongraph-macros = { path = "../moongraph-macros", version = "^0.1" }
+moongraph-macros = { path = "../moongraph-macros", version = "^0.1.1" }
 rayon = { version = "^1.7", optional = true }
 snafu = "0.7.4"

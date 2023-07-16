@@ -56,6 +56,26 @@ fn gen_edges_body(ast: &Data, name: &Ident) -> (proc_macro2::TokenStream, Vec<Ty
     (fetch_return, tys)
 }
 
+/// Macro for deriving structs that encode a node's edges/resource usage.
+///
+/// The quickest way to get a node up and running that uses edges/resources is to
+/// write a function that takes a tuple of `View`, `ViewMut` or `Move` and results
+/// in a tuple or error, but you can also use `#[derive(Edges)]` on your own structs
+/// if each of the fields is one of `View`, `ViewMut` or `Move`.
+///
+/// For this `Edges`, `GraphError`, `TypeMap` and `TypeKey` must all be in scope.
+///
+/// ## Example
+/// ```rust
+/// use moongraph::{Edges, GraphError, TypeMap, TypeKey, ViewMut, View, Move};
+///
+/// #[derive(Edges)]
+/// struct MyData {
+///     an_f32: ViewMut<f32>,
+///     a_u32: View<u32>,
+///     a_str: Move<&'static str>,
+/// }
+/// ```
 #[proc_macro_derive(Edges)]
 pub fn derive_edges(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input: DeriveInput = syn::parse_macro_input!(input);
@@ -66,7 +86,7 @@ pub fn derive_edges(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         /// Adds a `Edges` bound on each of the system data types.
         fn constrain_system_data_types(clause: &mut WhereClause, tys: &[Type]) {
             for ty in tys.iter() {
-                let where_predicate: WherePredicate = syn::parse_quote!(#ty : moongraph::Edges);
+                let where_predicate: WherePredicate = syn::parse_quote!(#ty : Edges);
                 clause.predicates.push(where_predicate);
             }
         }
@@ -78,32 +98,32 @@ pub fn derive_edges(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
     let output = quote! {
-        impl #impl_generics moongraph::Edges for #name #ty_generics #where_clause {
-            fn reads() -> Vec<moongraph::TypeKey> {
+        impl #impl_generics Edges for #name #ty_generics #where_clause {
+            fn reads() -> Vec<TypeKey> {
                 let mut r = Vec::new();
                 #({
-                    r.extend(<#tys as moongraph::Edges>::reads());
+                    r.extend(<#tys as Edges>::reads());
                 })*
                 r
             }
 
-            fn writes() -> Vec<moongraph::TypeKey> {
+            fn writes() -> Vec<TypeKey> {
                 let mut r = Vec::new();
                 #({
-                    r.extend(<#tys as moongraph::Edges>::writes());
+                    r.extend(<#tys as Edges>::writes());
                 })*
                 r
             }
 
-            fn moves() -> Vec<moongraph::TypeKey> {
+            fn moves() -> Vec<TypeKey> {
                 let mut r = Vec::new();
                 #({
-                    r.extend(<#tys as moongraph::Edges>::moves());
+                    r.extend(<#tys as Edges>::moves());
                 })*
                 r
             }
 
-            fn construct(resources: &mut moongraph::TypeMap) -> Result<Self, moongraph::GraphError> {
+            fn construct(resources: &mut TypeMap) -> Result<Self, GraphError> {
                 Ok(#construct_return)
             }
         }
