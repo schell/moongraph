@@ -699,13 +699,14 @@ impl Graph {
                     }
                     GraphError::Scheduling { source }
                 })?;
-        let batched_names = schedule.batched_names();
-        log::trace!("{:#?}", batched_names);
         self.schedule = schedule.batches;
         // Order the nodes in each batch by node name so they are deterministic.
         for batch in self.schedule.iter_mut() {
             batch.sort_by(|a, b| a.name().cmp(b.name()));
         }
+
+        let batched_names = self.get_schedule_and_resources();
+        log::trace!("{:#?}", batched_names);
         Ok(())
     }
 
@@ -719,6 +720,32 @@ impl Graph {
         self.schedule
             .iter()
             .map(|batch| batch.iter().map(|node| node.name()).collect())
+            .collect()
+    }
+
+    /// Return the names of scheduled nodes along with the names of their resources.
+    ///
+    /// If no nodes have been scheduled this will return an empty vector.
+    ///
+    /// Use [`Graph::reschedule`] to manually schedule the nodes before calling
+    /// this.
+    pub fn get_schedule_and_resources(&self) -> Vec<Vec<(&str, Vec<&str>)>> {
+        self.schedule
+            .iter()
+            .map(|batch| {
+                batch
+                    .iter()
+                    .map(|node| {
+                        let name = node.name();
+                        let inputs = node
+                            .all_inputs()
+                            .into_iter()
+                            .map(|key| key.name())
+                            .collect();
+                        (name, inputs)
+                    })
+                    .collect()
+            })
             .collect()
     }
 
