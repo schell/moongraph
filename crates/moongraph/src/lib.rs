@@ -457,6 +457,14 @@ impl<'a, T: Any + Send + Sync> Edges for ViewMut<T> {
     }
 }
 
+/// Contains the nodes/functions and specifies their execution order.
+#[derive(Default)]
+pub struct Execution {
+    barrier: usize,
+    unscheduled: Vec<Node<Function, TypeKey>>,
+    schedule: Vec<Vec<Node<Function, TypeKey>>>,
+}
+
 /// An acyclic, directed graph made up of nodes/functions and edges/resources.
 ///
 /// Notably nodes may have additional run requirements added to them besides
@@ -471,9 +479,7 @@ impl<'a, T: Any + Send + Sync> Edges for ViewMut<T> {
 #[derive(Default)]
 pub struct Graph {
     resources: TypeMap,
-    barrier: usize,
-    unscheduled: Vec<Node<Function, TypeKey>>,
-    schedule: Vec<Vec<Node<Function, TypeKey>>>,
+    execution: Execution,
 }
 
 impl Graph {
@@ -584,14 +590,17 @@ impl Graph {
         rhs.unschedule();
         let Graph {
             resources: mut rhs_resources,
-            unscheduled: rhs_nodes,
-            barrier: _,
-            schedule: _,
+            execution:
+                Execution {
+                    unscheduled: rhs_nodes,
+                    barrier: _,
+                    schedule: _,
+                },
         } = rhs;
         self.resources
             .extend(std::mem::take(rhs_resources.deref_mut()).into_iter());
         let mut unscheduled: HashMap<String, Node<Function, TypeKey>> = HashMap::default();
-        let lhs_nodes = std::mem::take(&mut self.unscheduled);
+        let lhs_nodes = std::mem::take(&mut self.execution.unscheduled);
         unscheduled.extend(
             lhs_nodes
                 .into_iter()
@@ -602,8 +611,8 @@ impl Graph {
                 .into_iter()
                 .map(|node| (node.name().to_string(), node)),
         );
-        self.unscheduled = unscheduled.into_iter().map(|v| v.1).collect();
-        self.barrier = self.barrier.max(rhs.barrier);
+        self.execution.unscheduled = unscheduled.into_iter().map(|v| v.1).collect();
+        self.execution.barrier = self.execution.barrier.max(rhs.execution.barrier);
         self
     }
 
@@ -657,26 +666,34 @@ impl Graph {
         rhs.unschedule();
         let Graph {
             resources: mut rhs_resources,
-            unscheduled: rhs_nodes,
-            barrier: rhs_barrier,
-            schedule: _,
+            execution:
+                Execution {
+                    unscheduled: rhs_nodes,
+                    barrier: rhs_barrier,
+                    schedule: _,
+                },
         } = rhs;
-        let base_barrier = self.barrier;
-        self.barrier = base_barrier + rhs_barrier;
+        let base_barrier = self.execution.barrier;
+        self.execution.barrier = base_barrier + rhs_barrier;
         self.resources
             .extend(std::mem::take(rhs_resources.deref_mut()).into_iter());
-        self.unscheduled.extend(rhs_nodes.into_iter().map(|node| {
-            let barrier = node.get_barrier();
-            node.with_barrier(base_barrier + barrier)
-        }));
+        self.execution
+            .unscheduled
+            .extend(rhs_nodes.into_iter().map(|node| {
+                let barrier = node.get_barrier();
+                node.with_barrier(base_barrier + barrier)
+            }));
 
         self
     }
 
     /// Unschedule all functions.
     fn unschedule(&mut self) {
-        self.unscheduled
-            .extend(std::mem::take(&mut self.schedule).into_iter().flatten());
+        self.execution.unscheduled.extend(
+            std::mem::take(&mut self.execution.schedule)
+                .into_iter()
+                .flatten(),
+        );
     }
 
     /// Reschedule all functions.
@@ -686,7 +703,7 @@ impl Graph {
     pub fn reschedule(&mut self) -> Result<(), GraphError> {
         log::trace!("rescheduling the render graph:");
         self.unschedule();
-        let all_nodes = std::mem::take(&mut self.unscheduled);
+        let all_nodes = std::mem::take(&mut self.execution.unscheduled);
         let dag = all_nodes
             .into_iter()
             .fold(Dag::default(), |dag, node| dag.with_node(node));
@@ -699,9 +716,9 @@ impl Graph {
                     }
                     GraphError::Scheduling { source }
                 })?;
-        self.schedule = schedule.batches;
+        self.execution.schedule = schedule.batches;
         // Order the nodes in each batch by node name so they are deterministic.
-        for batch in self.schedule.iter_mut() {
+        for batch in self.execution.schedule.iter_mut() {
             batch.sort_by(|a, b| a.name().cmp(b.name()));
         }
 
@@ -717,7 +734,8 @@ impl Graph {
     /// Use [`Graph::reschedule`] to manually schedule the nodes before calling
     /// this.
     pub fn get_schedule(&self) -> Vec<Vec<&str>> {
-        self.schedule
+        self.execution
+            .schedule
             .iter()
             .map(|batch| batch.iter().map(|node| node.name()).collect())
             .collect()
@@ -730,7 +748,8 @@ impl Graph {
     /// Use [`Graph::reschedule`] to manually schedule the nodes before calling
     /// this.
     pub fn get_schedule_and_resources(&self) -> Vec<Vec<(&str, Vec<&str>)>> {
-        self.schedule
+        self.execution
+            .schedule
             .iter()
             .map(|batch| {
                 batch
@@ -751,18 +770,20 @@ impl Graph {
 
     /// An iterator over all nodes.
     pub fn nodes(&self) -> impl Iterator<Item = &Node<Function, TypeKey>> {
-        self.schedule
+        self.execution
+            .schedule
             .iter()
             .flatten()
-            .chain(self.unscheduled.iter())
+            .chain(self.execution.unscheduled.iter())
     }
 
     /// A mutable iterator over all nodes.
     pub fn nodes_mut(&mut self) -> impl Iterator<Item = &mut Node<Function, TypeKey>> {
-        self.schedule
+        self.execution
+            .schedule
             .iter_mut()
             .flatten()
-            .chain(self.unscheduled.iter_mut())
+            .chain(self.execution.unscheduled.iter_mut())
     }
 
     /// Add multiple nodes to this graph.
@@ -772,7 +793,9 @@ impl Graph {
 
     /// Add a node to the graph.
     pub fn add_node(&mut self, node: Node<Function, TypeKey>) {
-        self.unscheduled.push(node.runs_after_barrier(self.barrier));
+        self.execution
+            .unscheduled
+            .push(node.runs_after_barrier(self.execution.barrier));
     }
 
     /// Return a reference to the node with the given name, if possible.
@@ -801,13 +824,13 @@ impl Graph {
     pub fn remove_node(&mut self, name: impl AsRef<str>) -> Option<Node<Function, TypeKey>> {
         self.unschedule();
         let mut may_index = None;
-        for (i, node) in self.unscheduled.iter().enumerate() {
+        for (i, node) in self.execution.unscheduled.iter().enumerate() {
             if node.name() == name.as_ref() {
                 may_index = Some(i);
             }
         }
         if let Some(i) = may_index.take() {
-            Some(self.unscheduled.swap_remove(i))
+            Some(self.execution.unscheduled.swap_remove(i))
         } else {
             None
         }
@@ -842,10 +865,10 @@ impl Graph {
     pub fn contains_node(&self, name: impl AsRef<str>) -> bool {
         let name = name.as_ref();
         let search = |node: &Node<Function, TypeKey>| node.name() == name;
-        if self.unscheduled.iter().any(search) {
+        if self.execution.unscheduled.iter().any(search) {
             return true;
         }
-        self.schedule.iter().flatten().any(search)
+        self.execution.schedule.iter().flatten().any(search)
     }
 
     /// Return whether the graph contains a resource with the parameterized
@@ -876,7 +899,7 @@ impl Graph {
     /// All nodes added after the barrier will run after nodes added before the
     /// barrier.
     pub fn add_barrier(&mut self) {
-        self.barrier += 1;
+        self.execution.barrier += 1;
     }
 
     /// Add a barrier to the graph.
@@ -892,7 +915,7 @@ impl Graph {
     ///
     /// This will be the barrier for any added nodes.
     pub fn get_barrier(&self) -> usize {
-        self.barrier
+        self.execution.barrier
     }
 
     /// Add a locally run function to the graph by adding its name, input and
@@ -944,7 +967,7 @@ impl Graph {
             }
         });
 
-        if !self.unscheduled.is_empty() {
+        if !self.execution.unscheduled.is_empty() {
             self.reschedule()?;
         }
 
@@ -996,7 +1019,7 @@ impl Graph {
             }
         }
 
-        for nodes in self.schedule.iter_mut() {
+        for nodes in self.execution.schedule.iter_mut() {
             let mut batch = Batch::default();
             for node in nodes.iter() {
                 let input = (node.inner().prepare)(&mut self.resources)?;
@@ -1102,6 +1125,11 @@ impl Graph {
         Ok(s)
     }
 
+    /// Split the graph into an execution (schedule of functions/nodes) and resources.
+    pub fn into_parts(self) -> (Execution, TypeMap) {
+        (self.execution, self.resources)
+    }
+
     #[cfg(feature = "dot")]
     /// Save the graph to the filesystem as a dot file to be visualized with
     /// graphiz (or similar).
@@ -1132,7 +1160,10 @@ impl Graph {
     }
 
     pub fn _last_node(&self) -> Option<String> {
-        self.unscheduled.last().map(|node| node.name().to_string())
+        self.execution
+            .unscheduled
+            .last()
+            .map(|node| node.name().to_string())
     }
 }
 
