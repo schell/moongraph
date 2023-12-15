@@ -1,4 +1,4 @@
-//! DAG scheduling, resource managment, and execution.
+//! DAG scheduling, resource management, and execution.
 //!
 //! In `moongraph`, nodes are functions with parameters that are accessed
 //! immutably, mutably or by move.

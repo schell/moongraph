@@ -4,7 +4,7 @@
 
 In `moongraph`, graph nodes are normal Rust functions and graph edges are function parameters and function results.
 
-The graph is built automatically by registering each function. `moongraph` figures out how the functions connect by their paramaters and their results.
+The graph is built automatically by registering each function. `moongraph` figures out how the functions connect by their parameters and their results.
 
 `moongraph` validates and schedules nodes to run in parallel where possible, using `rayon` as the underlying parallelizing tech. This only happens when compiled with the "parallel" feature, on by default.
 
