@@ -19,6 +19,10 @@ The graph is built automatically by registering each function. `moongraph` figur
 
 Scheduling and running DAGs is a common problem and I didn't find any prior art.
 
+## how
+
+[Read the introduction tutorial](https://docs.rs/moongraph/0.3.7/moongraph/tutorial/index.html)
+
 ## uses
 
 `moongraph` is in use in a number of other libraries (let me know if you use it in yours, and how :))
