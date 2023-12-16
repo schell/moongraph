@@ -58,12 +58,13 @@ fn gen_edges_body(ast: &Data, name: &Ident) -> (proc_macro2::TokenStream, Vec<Ty
 
 /// Macro for deriving structs that encode a node's edges/resource usage.
 ///
-/// The quickest way to get a node up and running that uses edges/resources is to
-/// write a function that takes a tuple of `View`, `ViewMut` or `Move` and results
-/// in a tuple or error, but you can also use `#[derive(Edges)]` on your own structs
-/// if each of the fields is one of `View`, `ViewMut` or `Move`.
+/// This is the quickest way to get a node up and running that uses a struct as
+/// its edges. Simply add `#[derive(Edges)]` on your own structs if each of the
+/// fields is one of `View`, `ViewMut` or `Move`.
 ///
-/// For this `Edges`, `GraphError`, `TypeMap` and `TypeKey` must all be in scope.
+/// ## Note:
+/// For this to work, `Edges`, `GraphError`, `TypeMap` and `TypeKey` must all be
+/// in scope.
 ///
 /// ## Example
 /// ```rust

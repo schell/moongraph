@@ -24,6 +24,12 @@ pub use broomdog::{TypeKey, TypeMap};
 pub use dagga::{DaggaError, Node};
 pub use moongraph_macros::Edges;
 
+#[cfg(feature = "tutorial")]
+mod tutorial_impl;
+
+#[cfg(feature = "tutorial")]
+pub use tutorial_impl::tutorial;
+
 /// All errors.
 #[derive(Debug, Snafu)]
 pub enum GraphError {
@@ -91,6 +97,9 @@ fn missing_local(_: ()) -> Result<(), GraphError> {
 /// The `Edges` trait allows the library user to construct types that use
 /// resources. This is convenient when the number of resources becomes large
 /// and using a tuple becomes unwieldy.
+///
+/// There exists a derive macro [`Edges`](derive@Edges) to help implementing
+/// this trait.
 pub trait Edges: Sized {
     /// Keys of all read types used in fields in the implementor.
     fn reads() -> Vec<TypeKey> {
@@ -295,9 +304,9 @@ fn save<Output: NodeResults + Any + Send + Sync>(
 ///   wrapped in [`Move`]. The resource will not be available in the graph after
 ///   the node is run.
 /// * Read one or more resources by having a field in the input parameter
-///   wrapped in [`Read`].
+///   wrapped in [`View`].
 /// * Write one or more resources by having a field in the input parameter
-///   wrapped in [`Write`].
+///   wrapped in [`ViewMut`].
 ///
 /// By default `IsGraphNode` is implemented for functions that take one
 /// parameter implementing [`Edges`] and returning a `Result` where the "ok"
@@ -380,6 +389,12 @@ impl<T> DerefMut for Move<T> {
     }
 }
 
+impl<T: std::fmt::Display> std::fmt::Display for Move<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
 /// Specifies a graph edge/resource that can be "read" by a node.
 pub struct View<T> {
     inner: Loan,
@@ -412,6 +427,13 @@ impl<T: Any + Send + Sync> Edges for View<T> {
             inner,
             _phantom: PhantomData,
         })
+    }
+}
+
+impl<T: std::fmt::Display + Any + Send + Sync> std::fmt::Display for View<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let t: &T = self.inner.downcast_ref().unwrap();
+        t.fmt(f)
     }
 }
 
@@ -457,6 +479,13 @@ impl<'a, T: Any + Send + Sync> Edges for ViewMut<T> {
     }
 }
 
+impl<T: std::fmt::Display + Any + Send + Sync> std::fmt::Display for ViewMut<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let t: &T = self.inner.downcast_ref().unwrap();
+        t.fmt(f)
+    }
+}
+
 /// Contains the nodes/functions and specifies their execution order.
 #[derive(Default)]
 pub struct Execution {
@@ -494,9 +523,9 @@ impl Graph {
     ///   wrapped in [`Move`]. The resource will not be available in the graph
     ///   after the node is run.
     /// * Read one or more resources by having a field in the input parameter
-    ///   wrapped in [`Read`].
+    ///   wrapped in [`View`].
     /// * Write one or more resources by having a field in the input parameter
-    ///   wrapped in [`Write`].
+    ///   wrapped in [`ViewMut`].
     ///
     /// By default `IsGraphNode` is implemented for functions that take one
     /// parameter implementing [`Edges`] and returning a `Result` where the "ok"
