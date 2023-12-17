@@ -421,7 +421,7 @@ impl<T> Gen<T> for NoDefault {
 
 /// Immutably borrowed resource that _may_ be created by default.
 ///
-/// [`View`] and [`ViewMut`] are the main way node functions interact with resources.
+/// Node functions wrap their parameters in [`View`], [`ViewMut`] or [`Move`].
 ///
 /// `View` has two type parameters:
 /// * `T` - The type of the resource.
@@ -467,7 +467,8 @@ impl<T: Any + Send + Sync, G: Gen<T>> Edges for View<T, G> {
                 let t = G::generate().context(MissingSnafu {
                     name: std::any::type_name::<T>(),
                 })?;
-                // UNWRAP: safe because we know this type was missing
+                // UNWRAP: safe because we know this type was missing, and no other type
+                // is stored with this type's type id.
                 let _ = resources.insert_value(t).unwrap();
                 log::trace!("generated missing {}", std::any::type_name::<T>());
                 // UNWRAP: safe because we just inserted
@@ -488,13 +489,33 @@ impl<T: std::fmt::Display + Any + Send + Sync, G: Gen<T>> std::fmt::Display for 
     }
 }
 
-/// Specifies a graph edge/resource that can be "written" to by a node.
-pub struct ViewMut<T> {
+/// A mutably borrowed resource that may be created by default.
+///
+/// Node functions wrap their parameters in [`View`], [`ViewMut`] or [`Move`].
+///
+/// `ViewMut` has two type parameters:
+/// * `T` - The type of the resource.
+/// * `G` - The method by which the resource can be generated if it doesn't
+///   already exist. By default this is [`SomeDefault`], which denotes creating
+///   the resource using its default implementation. Another option is
+///   [`NoDefault`] which fails to generate the resource.
+///
+/// ```rust
+/// use moongraph::*;
+///
+/// let mut graph = Graph::default();
+/// let default_number = graph.visit(|u: ViewMut<usize>| { *u }).map_err(|e| e.to_string());
+/// assert_eq!(Ok(0), default_number);
+///
+/// let no_number = graph.visit(|f: ViewMut<f32, NoDefault>| *f);
+/// assert!(no_number.is_err());
+/// ```
+pub struct ViewMut<T, G: Gen<T> = SomeDefault> {
     inner: LoanMut,
-    _phantom: PhantomData<T>,
+    _phantom: PhantomData<(T, G)>,
 }
 
-impl<T: Any + Send + Sync> Deref for ViewMut<T> {
+impl<T: Any + Send + Sync, G: Gen<T>> Deref for ViewMut<T, G> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -503,26 +524,34 @@ impl<T: Any + Send + Sync> Deref for ViewMut<T> {
     }
 }
 
-impl<T: Any + Send + Sync> DerefMut for ViewMut<T> {
+impl<T: Any + Send + Sync, G: Gen<T>> DerefMut for ViewMut<T, G> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         // UNWRAP: safe because it was constructed with `T`
         self.inner.downcast_mut().unwrap()
     }
 }
 
-impl<'a, T: Any + Send + Sync> Edges for ViewMut<T> {
+impl<'a, T: Any + Send + Sync, G: Gen<T>> Edges for ViewMut<T, G> {
     fn writes() -> Vec<TypeKey> {
         vec![TypeKey::new::<T>()]
     }
 
     fn construct(resources: &mut TypeMap) -> Result<Self, GraphError> {
         let key = TypeKey::new::<T>();
-        let inner = resources
-            .loan_mut(key)
-            .context(ResourceSnafu)?
-            .context(MissingSnafu {
-                name: std::any::type_name::<T>(),
-            })?;
+        let inner = match resources.loan_mut(key).context(ResourceSnafu)? {
+            Some(inner) => inner,
+            None => {
+                let t = G::generate().context(MissingSnafu {
+                    name: std::any::type_name::<T>(),
+                })?;
+                // UNWRAP: safe because we know this type was missing, and no other type
+                // is stored with this type's type id.
+                let _ = resources.insert_value(t).unwrap();
+                log::trace!("generated missing {}", std::any::type_name::<T>());
+                // UNWRAP: safe because we just inserted
+                resources.loan_mut(key).unwrap().unwrap()
+            }
+        };
         Ok(ViewMut {
             inner,
             _phantom: PhantomData,
@@ -530,7 +559,7 @@ impl<'a, T: Any + Send + Sync> Edges for ViewMut<T> {
     }
 }
 
-impl<T: std::fmt::Display + Any + Send + Sync> std::fmt::Display for ViewMut<T> {
+impl<T: std::fmt::Display + Any + Send + Sync, G: Gen<T>> std::fmt::Display for ViewMut<T, G> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let t: &T = self.inner.downcast_ref().unwrap();
         t.fmt(f)
