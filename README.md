@@ -1,4 +1,4 @@
-# 🌙 moongraph 📈
+# moongraph 🌙📈
 
 `moongraph` is a Rust library for scheduling, managing resources, and running directed acyclic graphs.
 
