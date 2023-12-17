@@ -204,9 +204,16 @@
 /// ```rust
 /// use moongraph::*;
 ///
+/// #[derive(Default)]
 /// pub struct Position(f32, f32);
+///
+/// #[derive(Default)]
 /// pub struct Velocity(f32, f32);
+///
+/// #[derive(Default)]
 /// pub struct Acceleration(f32, f32);
+///
+/// #[derive(Default)]
 /// pub struct BankAccount {
 ///     interest_rate: f32,
 ///     balance: f32,
@@ -259,6 +266,8 @@
 /// ```
 ///
 /// Notice how the returned schedule shows that `add_velocity` and `compound_interest` can run together in parallel. We call this a "batch". It's possible to run all nodes in a batch at the same time because none of their borrows conflict and there are no explicit ordering constraints between them.
+///
+///
 ///
 /// ## Conclusion
 /// Hopefully by this point you have a better idea what `moongraph` is about and how to use it.

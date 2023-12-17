@@ -395,13 +395,57 @@ impl<T: std::fmt::Display> std::fmt::Display for Move<T> {
     }
 }
 
-/// Specifies a graph edge/resource that can be "read" by a node.
-pub struct View<T> {
-    inner: Loan,
-    _phantom: PhantomData<T>,
+/// Used to generate a default value of a resource, if possible.
+pub trait Gen<T> {
+    fn generate() -> Option<T>;
 }
 
-impl<T: Any + Send + Sync> Deref for View<T> {
+/// Valueless type that represents the ability to generate a resource by
+/// default.
+pub struct SomeDefault;
+
+impl<T: Default> Gen<T> for SomeDefault {
+    fn generate() -> Option<T> {
+        Some(T::default())
+    }
+}
+
+/// Valueless type that represents the **inability** to generate a resource by default.
+pub struct NoDefault;
+
+impl<T> Gen<T> for NoDefault {
+    fn generate() -> Option<T> {
+        None
+    }
+}
+
+/// Immutably borrowed resource that _may_ be created by default.
+///
+/// Node functions wrap their parameters in [`View`], [`ViewMut`] or [`Move`].
+///
+/// `View` has two type parameters:
+/// * `T` - The type of the resource.
+/// * `G` - The method by which the resource can be generated if it doesn't
+///   already exist. By default this is [`SomeDefault`], which denotes creating the
+///   resource using its default instance. Another option is [`NoDefault`] which
+///   fails to generate the resource.
+///
+/// ```rust
+/// use moongraph::*;
+///
+/// let mut graph = Graph::default();
+/// let default_number = graph.visit(|u: View<usize>| { *u }).map_err(|e| e.to_string());
+/// assert_eq!(Ok(0), default_number);
+///
+/// let no_number = graph.visit(|f: View<f32, NoDefault>| *f);
+/// assert!(no_number.is_err());
+/// ```
+pub struct View<T, G: Gen<T> = SomeDefault> {
+    inner: Loan,
+    _phantom: PhantomData<(T, G)>,
+}
+
+impl<T: Any + Send + Sync, G: Gen<T>> Deref for View<T, G> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -410,19 +454,27 @@ impl<T: Any + Send + Sync> Deref for View<T> {
     }
 }
 
-impl<T: Any + Send + Sync> Edges for View<T> {
+impl<T: Any + Send + Sync, G: Gen<T>> Edges for View<T, G> {
     fn reads() -> Vec<TypeKey> {
         vec![TypeKey::new::<T>()]
     }
 
     fn construct(resources: &mut TypeMap) -> Result<Self, GraphError> {
         let key = TypeKey::new::<T>();
-        let inner = resources
-            .loan(key)
-            .context(ResourceSnafu)?
-            .context(MissingSnafu {
-                name: std::any::type_name::<T>(),
-            })?;
+        let inner = match resources.loan(key).context(ResourceSnafu)? {
+            Some(inner) => inner,
+            None => {
+                let t = G::generate().context(MissingSnafu {
+                    name: std::any::type_name::<T>(),
+                })?;
+                // UNWRAP: safe because we know this type was missing, and no other type
+                // is stored with this type's type id.
+                let _ = resources.insert_value(t).unwrap();
+                log::trace!("generated missing {}", std::any::type_name::<T>());
+                // UNWRAP: safe because we just inserted
+                resources.loan(key).unwrap().unwrap()
+            }
+        };
         Ok(View {
             inner,
             _phantom: PhantomData,
@@ -430,20 +482,40 @@ impl<T: Any + Send + Sync> Edges for View<T> {
     }
 }
 
-impl<T: std::fmt::Display + Any + Send + Sync> std::fmt::Display for View<T> {
+impl<T: std::fmt::Display + Any + Send + Sync, G: Gen<T>> std::fmt::Display for View<T, G> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let t: &T = self.inner.downcast_ref().unwrap();
         t.fmt(f)
     }
 }
 
-/// Specifies a graph edge/resource that can be "written" to by a node.
-pub struct ViewMut<T> {
+/// A mutably borrowed resource that may be created by default.
+///
+/// Node functions wrap their parameters in [`View`], [`ViewMut`] or [`Move`].
+///
+/// `ViewMut` has two type parameters:
+/// * `T` - The type of the resource.
+/// * `G` - The method by which the resource can be generated if it doesn't
+///   already exist. By default this is [`SomeDefault`], which denotes creating
+///   the resource using its default implementation. Another option is
+///   [`NoDefault`] which fails to generate the resource.
+///
+/// ```rust
+/// use moongraph::*;
+///
+/// let mut graph = Graph::default();
+/// let default_number = graph.visit(|u: ViewMut<usize>| { *u }).map_err(|e| e.to_string());
+/// assert_eq!(Ok(0), default_number);
+///
+/// let no_number = graph.visit(|f: ViewMut<f32, NoDefault>| *f);
+/// assert!(no_number.is_err());
+/// ```
+pub struct ViewMut<T, G: Gen<T> = SomeDefault> {
     inner: LoanMut,
-    _phantom: PhantomData<T>,
+    _phantom: PhantomData<(T, G)>,
 }
 
-impl<T: Any + Send + Sync> Deref for ViewMut<T> {
+impl<T: Any + Send + Sync, G: Gen<T>> Deref for ViewMut<T, G> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -452,26 +524,34 @@ impl<T: Any + Send + Sync> Deref for ViewMut<T> {
     }
 }
 
-impl<T: Any + Send + Sync> DerefMut for ViewMut<T> {
+impl<T: Any + Send + Sync, G: Gen<T>> DerefMut for ViewMut<T, G> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         // UNWRAP: safe because it was constructed with `T`
         self.inner.downcast_mut().unwrap()
     }
 }
 
-impl<'a, T: Any + Send + Sync> Edges for ViewMut<T> {
+impl<'a, T: Any + Send + Sync, G: Gen<T>> Edges for ViewMut<T, G> {
     fn writes() -> Vec<TypeKey> {
         vec![TypeKey::new::<T>()]
     }
 
     fn construct(resources: &mut TypeMap) -> Result<Self, GraphError> {
         let key = TypeKey::new::<T>();
-        let inner = resources
-            .loan_mut(key)
-            .context(ResourceSnafu)?
-            .context(MissingSnafu {
-                name: std::any::type_name::<T>(),
-            })?;
+        let inner = match resources.loan_mut(key).context(ResourceSnafu)? {
+            Some(inner) => inner,
+            None => {
+                let t = G::generate().context(MissingSnafu {
+                    name: std::any::type_name::<T>(),
+                })?;
+                // UNWRAP: safe because we know this type was missing, and no other type
+                // is stored with this type's type id.
+                let _ = resources.insert_value(t).unwrap();
+                log::trace!("generated missing {}", std::any::type_name::<T>());
+                // UNWRAP: safe because we just inserted
+                resources.loan_mut(key).unwrap().unwrap()
+            }
+        };
         Ok(ViewMut {
             inner,
             _phantom: PhantomData,
@@ -479,7 +559,7 @@ impl<'a, T: Any + Send + Sync> Edges for ViewMut<T> {
     }
 }
 
-impl<T: std::fmt::Display + Any + Send + Sync> std::fmt::Display for ViewMut<T> {
+impl<T: std::fmt::Display + Any + Send + Sync, G: Gen<T>> std::fmt::Display for ViewMut<T, G> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let t: &T = self.inner.downcast_ref().unwrap();
         t.fmt(f)
@@ -1090,11 +1170,15 @@ impl Graph {
     }
 
     /// Get a reference to a resource in the graph.
+    ///
+    /// If the resource _does not_ exist `Ok(None)` will be returned.
     pub fn get_resource<T: Any + Send + Sync>(&self) -> Result<Option<&T>, GraphError> {
         Ok(self.resources.get_value().context(ResourceSnafu)?)
     }
 
     /// Get a mutable reference to a resource in the graph.
+    ///
+    /// If the resource _does not_ exist `Ok(None)` will be returned.
     pub fn get_resource_mut<T: Any + Send + Sync>(&mut self) -> Result<Option<&mut T>, GraphError> {
         Ok(self.resources.get_value_mut().context(ResourceSnafu)?)
     }
@@ -1504,5 +1588,17 @@ mod test {
         let run_was_all_good = graph.get_resource::<bool>().unwrap().unwrap();
         assert!(run_was_all_good, "run was not all good");
         assert_eq!(110.0, my_num, "local did not run");
+    }
+
+    #[test]
+    // Tests that Gen will generate a default for a missing resource,
+    // and that the result will be stored in the graph.
+    fn can_generate_view_default() {
+        let mut graph = Graph::default();
+        let u = graph.visit(|u: View<usize>| *u).unwrap();
+        assert_eq!(0, u);
+
+        let my_u = graph.get_resource::<usize>().unwrap();
+        assert_eq!(Some(0), my_u.copied());
     }
 }
