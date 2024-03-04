@@ -20,7 +20,7 @@ use snafu::prelude::*;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-pub use broomdog::{TypeKey, TypeMap};
+pub use broomdog::{BroomdogErr, TypeKey, TypeMap};
 pub use dagga::{DaggaError, Node};
 pub use moongraph_macros::Edges;
 
@@ -33,11 +33,6 @@ pub use tutorial_impl::tutorial;
 /// All errors.
 #[derive(Debug, Snafu)]
 pub enum GraphError {
-    #[snafu(display("Error while running node: {}", error))]
-    RunningNode {
-        error: Box<dyn std::error::Error + Send + Sync + 'static>,
-    },
-
     #[snafu(display("Error while running local node {error}"))]
     RunningLocalNode { error: String },
 
@@ -47,27 +42,67 @@ pub enum GraphError {
     #[snafu(display("Resource error: {source}"))]
     Resource { source: broomdog::BroomdogErr },
 
-    #[snafu(display("Resource is loaned"))]
-    Loaned,
+    #[snafu(display("Resource '{type_name}' is loaned"))]
+    ResourceLoaned { type_name: &'static str },
 
     #[snafu(display("Missing resource '{name}'"))]
     Missing { name: &'static str },
 
     #[snafu(display("Encountered local function that was not provided or already run"))]
     MissingLocal,
+
+    #[snafu(display("Node should be trimmed"))]
+    TrimNode,
+
+    #[snafu(display("Unrecoverable error while running node: {source}"))]
+    Other {
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
 }
 
-type Resource = Box<dyn Any + Send + Sync>;
+impl From<broomdog::BroomdogErr> for GraphError {
+    fn from(source: broomdog::BroomdogErr) -> Self {
+        GraphError::Resource { source }
+    }
+}
+
+impl GraphError {
+    pub fn other(err: impl std::error::Error + Send + Sync + 'static) -> Self {
+        GraphError::Other {
+            source: Box::new(err),
+        }
+    }
+}
+
+/// Returns a result meaning everything is ok and the node should run again next frame.
+pub fn ok() -> Result<(), GraphError> {
+    Ok(())
+}
+
+/// Returns a result meaning everything is ok, but the node should be removed from the graph.
+pub fn end() -> Result<(), GraphError> {
+    Err(GraphError::TrimNode)
+}
+
+/// Returns a result meaning an error occured and the graph cannot recover.
+pub fn err(err: impl std::error::Error + Send + Sync + 'static) -> Result<(), GraphError> {
+    Err(GraphError::other(err))
+}
+
+pub type Resource = Box<dyn Any + Send + Sync>;
+pub type FnPrepare = dyn Fn(&mut TypeMap) -> Result<Resource, GraphError>;
+pub type FnMutRun = dyn FnMut(Resource) -> Result<Resource, GraphError> + Send + Sync;
+pub type FnSave = dyn Fn(Resource, &mut TypeMap) -> Result<(), GraphError>;
 
 /// A function wrapper.
 ///
-/// Wraps a function by moving it into a closure. Before running the parameters
-/// of the function are constructed from a TypeMap of resources, and the results
+/// Wraps a function by moving it into a closure. Before running, the parameters
+/// of the function are constructed from a TypeMap of resources. The results
 /// of the function are packed back into the same TypeMap.
 pub struct Function {
-    prepare: Box<dyn Fn(&mut TypeMap) -> Result<Resource, GraphError>>,
-    run: Option<Box<dyn Fn(Resource) -> Result<Resource, GraphError> + Send + Sync>>,
-    save: Box<dyn Fn(Resource, &mut TypeMap) -> Result<(), GraphError>>,
+    prepare: Box<FnPrepare>,
+    run: Option<Box<FnMutRun>>,
+    save: Box<FnSave>,
 }
 
 impl Function {
@@ -77,11 +112,24 @@ impl Function {
         resources: Resource,
         local: &mut Option<impl FnOnce(Resource) -> Result<Resource, GraphError>>,
     ) -> Result<Resource, GraphError> {
-        if let Some(f) = self.run.as_ref() {
+        if let Some(f) = self.run.as_mut() {
             (f)(resources)
         } else {
             let local = local.take().context(MissingLocalSnafu)?;
             (local)(resources)
+        }
+    }
+
+    /// Create a new function.
+    pub fn new(
+        prepare: impl Fn(&mut TypeMap) -> Result<Resource, GraphError> + 'static,
+        run: impl Fn(Resource) -> Result<Resource, GraphError> + Send + Sync + 'static,
+        save: impl Fn(Resource, &mut TypeMap) -> Result<(), GraphError> + 'static,
+    ) -> Self {
+        Function {
+            prepare: Box::new(prepare),
+            run: Some(Box::new(run)),
+            save: Box::new(save),
         }
     }
 }
@@ -319,11 +367,10 @@ pub trait IsGraphNode<Input, Output> {
 impl<
         Input: Edges + Any + Send + Sync,
         Output: NodeResults + Any + Send + Sync,
-        F: Fn(Input) -> Result<Output, E> + Send + Sync + 'static,
-        E: std::error::Error + Send + Sync + 'static,
+        F: FnMut(Input) -> Result<Output, GraphError> + Send + Sync + 'static,
     > IsGraphNode<Input, Output> for F
 {
-    fn into_node(self) -> Node<Function, TypeKey> {
+    fn into_node(mut self) -> Node<Function, TypeKey> {
         let prepare = Box::new(prepare::<Input>);
         let save = Box::new(save::<Output>);
 
@@ -331,7 +378,7 @@ impl<
             let input = *resources.downcast::<Input>().unwrap();
             match (self)(input) {
                 Ok(creates) => Ok(Box::new(creates)),
-                Err(e) => Err(GraphError::RunningNode { error: Box::new(e) }),
+                Err(e) => Err(e),
             }
         });
         Node::new(Function {
@@ -361,10 +408,23 @@ impl<T: Any + Send + Sync> Edges for Move<T> {
         let inner_loan = resources
             .remove(&key)
             .context(MissingSnafu { name: key.name() })?;
-        let value = inner_loan.into_owned(key.name()).context(ResourceSnafu)?;
-        // UNWRAP: safe because we got this out as `T`
-        let box_t = value.downcast::<T>().unwrap();
-        Ok(Move { inner: *box_t })
+        match inner_loan.into_owned(key.name()) {
+            Ok(value) => {
+                // UNWRAP: safe because we got this out as `T`
+                let box_t = value.downcast::<T>().unwrap();
+                Ok(Move { inner: *box_t })
+            }
+            Err(loan) => {
+                // We really do **not** want to lose any resources
+                resources.insert(key, loan);
+                let err = ResourceLoanedSnafu {
+                    type_name: std::any::type_name::<T>(),
+                }
+                .build();
+                log::error!("{err}");
+                Err(err)
+            }
+        }
     }
 }
 
@@ -489,6 +549,32 @@ impl<T: std::fmt::Display + Any + Send + Sync, G: Gen<T>> std::fmt::Display for 
     }
 }
 
+impl<'a, T: Send + Sync + 'static, G: Gen<T>> IntoIterator for &'a View<T, G>
+where
+    &'a T: IntoIterator,
+{
+    type Item = <<&'a T as IntoIterator>::IntoIter as Iterator>::Item;
+
+    type IntoIter = <&'a T as IntoIterator>::IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.deref().into_iter()
+    }
+}
+
+impl<'a, S: Send + Sync + 'static, G: Gen<S>> IntoParallelIterator for &'a View<S, G>
+where
+    &'a S: IntoParallelIterator,
+{
+    type Iter = <&'a S as IntoParallelIterator>::Iter;
+
+    type Item = <&'a S as IntoParallelIterator>::Item;
+
+    fn into_par_iter(self) -> Self::Iter {
+        self.deref().into_par_iter()
+    }
+}
+
 /// A mutably borrowed resource that may be created by default.
 ///
 /// Node functions wrap their parameters in [`View`], [`ViewMut`] or [`Move`].
@@ -566,12 +652,252 @@ impl<T: std::fmt::Display + Any + Send + Sync, G: Gen<T>> std::fmt::Display for 
     }
 }
 
+impl<'a, T: Send + Sync + 'static, G: Gen<T>> IntoIterator for &'a ViewMut<T, G>
+where
+    &'a T: IntoIterator,
+{
+    type Item = <<&'a T as IntoIterator>::IntoIter as Iterator>::Item;
+
+    type IntoIter = <&'a T as IntoIterator>::IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.deref().into_iter()
+    }
+}
+
+impl<'a, T: Send + Sync + 'static, G: Gen<T>> IntoParallelIterator for &'a ViewMut<T, G>
+where
+    &'a T: IntoParallelIterator,
+{
+    type Item = <&'a T as IntoParallelIterator>::Item;
+
+    type Iter = <&'a T as IntoParallelIterator>::Iter;
+
+    fn into_par_iter(self) -> Self::Iter {
+        self.deref().into_par_iter()
+    }
+}
+
+impl<'a, T: Send + Sync + 'static, G: Gen<T>> IntoIterator for &'a mut ViewMut<T, G>
+where
+    &'a mut T: IntoIterator,
+{
+    type Item = <<&'a mut T as IntoIterator>::IntoIter as Iterator>::Item;
+
+    type IntoIter = <&'a mut T as IntoIterator>::IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.deref_mut().into_iter()
+    }
+}
+
+impl<'a, T: Send + Sync + 'static, G: Gen<T>> IntoParallelIterator for &'a mut ViewMut<T, G>
+where
+    &'a mut T: IntoParallelIterator,
+{
+    type Item = <&'a mut T as IntoParallelIterator>::Item;
+
+    type Iter = <&'a mut T as IntoParallelIterator>::Iter;
+
+    fn into_par_iter(self) -> Self::Iter {
+        self.deref_mut().into_par_iter()
+    }
+}
+
 /// Contains the nodes/functions and specifies their execution order.
 #[derive(Default)]
 pub struct Execution {
     barrier: usize,
     unscheduled: Vec<Node<Function, TypeKey>>,
     schedule: Vec<Vec<Node<Function, TypeKey>>>,
+}
+
+impl Execution {
+    /// Returns the number of nodes.
+    pub fn len(&self) -> usize {
+        self.unscheduled.len() + self.schedule.iter().map(|batch| batch.len()).sum::<usize>()
+    }
+}
+
+pub struct BatchResult<'graph> {
+    nodes: &'graph mut Vec<Node<Function, TypeKey>>,
+    resources: &'graph mut TypeMap,
+    results: Vec<Result<Resource, GraphError>>,
+}
+
+impl<'graph> BatchResult<'graph> {
+    /// Save the results of the batch run to the graph.
+    ///
+    /// Optionally trim any nodes that report a [`GraphError::TrimNode`] result.
+    ///
+    /// Unifies resources.
+    ///
+    /// Returns `true` if any nodes were trimmed.
+    pub fn save(self, should_trim_nodes: bool) -> Result<bool, GraphError> {
+        let BatchResult {
+            nodes,
+            resources,
+            results,
+        } = self;
+        let mut trimmed_any = false;
+        let mut trimmings = vec![false; nodes.len()];
+        for ((node, output), should_trim) in nodes.iter().zip(results).zip(trimmings.iter_mut()) {
+            match output {
+                Err(GraphError::TrimNode) => {
+                    // TrimNode is special in that it is not really an error.
+                    // Instead it means that the system which returned TrimNode should be
+                    // removed from the graph because its work is done.
+                    *should_trim = true;
+                    trimmed_any = should_trim_nodes;
+                }
+                Err(o) => {
+                    // A system hit an unrecoverable error.
+                    log::error!("node '{}' erred: {}", node.name(), o);
+                    return Err(o);
+                }
+                Ok(output) => (node.inner().save)(output, resources)?,
+            }
+        }
+
+        if trimmed_any {
+            let mut n = 0;
+            nodes.retain_mut(|_| {
+                let should_trim = trimmings[n];
+                n += 1;
+                !should_trim
+            });
+        }
+
+        resources.unify().context(ResourceSnafu)?;
+
+        Ok(trimmed_any)
+    }
+}
+
+pub struct Batch<'graph> {
+    nodes: &'graph mut Vec<Node<Function, TypeKey>>,
+    resources: &'graph mut TypeMap,
+    //inputs: Vec<Resource>,
+    //runs: Vec<&'graph Box<dyn Fn(Resource) -> Result<Resource, GraphError> + Send + Sync>>,
+    // local: Option<(
+    //     Resource,
+    //     Box<dyn FnOnce(Resource) -> Result<Resource, GraphError> + 'local>,
+    // )>,
+}
+
+impl<'a> Batch<'a> {
+    /// Create a new [`Batch`] with a local function.
+    pub fn new(resources: &'a mut TypeMap, nodes: &'a mut Vec<Node<Function, TypeKey>>) -> Self {
+        Batch { resources, nodes }
+    }
+
+    #[cfg(feature = "parallel")]
+    pub fn run(
+        self,
+        local: &mut Option<impl FnOnce(Resource) -> Result<Resource, GraphError>>,
+    ) -> Result<BatchResult<'a>, GraphError> {
+        let Batch { nodes, resources } = self;
+
+        let mut local_f = None;
+        let mut inputs = vec![];
+        let mut runs = vec![];
+        for node in nodes.iter_mut() {
+            let input = (node.inner().prepare)(resources)?;
+            if let Some(f) = node.inner_mut().run.as_mut() {
+                inputs.push(input);
+                runs.push(f);
+            } else {
+                let f = local.take().context(MissingLocalSnafu)?;
+                local_f = Some((
+                    input,
+                    Box::new(f) as Box<dyn FnOnce(Resource) -> Result<Resource, GraphError>>,
+                ));
+            }
+        }
+
+        let mut results = inputs
+            .into_par_iter()
+            .zip(runs.into_par_iter())
+            .map(|(input, f)| (f)(input))
+            .collect::<Vec<_>>();
+
+        if let Some((input, f)) = local_f {
+            results.push((f)(input));
+        }
+
+        Ok(BatchResult {
+            nodes,
+            results,
+            resources,
+        })
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    pub fn run(
+        self,
+        local: &mut Option<impl FnOnce(Resource) -> Result<Resource, GraphError>>,
+    ) -> Result<BatchResult<'a>, GraphError> {
+        let Batch { nodes, resources } = self;
+
+        let mut local_f = None;
+        let mut inputs = vec![];
+        let mut runs = vec![];
+        for node in nodes.iter() {
+            let input = (node.inner().prepare)(resources)?;
+            if let Some(f) = node.inner().run.as_ref() {
+                inputs.push(input);
+                runs.push(f);
+            } else {
+                let f = local.take().context(MissingLocalSnafu)?;
+                local_f = Some((
+                    input,
+                    Box::new(f) as Box<dyn FnOnce(Resource) -> Result<Resource, GraphError>>,
+                ));
+            }
+        }
+
+        let mut outputs = inputs
+            .into_iter()
+            .zip(runs.into_iter())
+            .map(|(input, f)| (f)(input))
+            .collect::<Vec<_>>();
+
+        if let Some((input, f)) = local_f {
+            outputs.push((f)(input));
+        }
+
+        Ok(BatchResult {
+            nodes,
+            results: outputs,
+            resources,
+        })
+    }
+}
+
+/// Provides access to consecutive batches of scheduled nodes/functions.
+pub struct Batches<'graph> {
+    schedule: std::slice::IterMut<'graph, Vec<Node<Function, TypeKey>>>,
+    resources: &'graph mut TypeMap,
+}
+
+impl<'graph> Batches<'graph> {
+    /// Overwrite the batch's resources, allowing the schedule to operate on a separate
+    /// set of resources.
+    pub fn set_resources(&mut self, resources: &'graph mut TypeMap) {
+        self.resources = resources;
+    }
+
+    pub fn next_batch(&mut self) -> Option<Batch> {
+        let nodes: &'graph mut Vec<_> = self.schedule.next()?;
+        let batch = Batch::new(self.resources, nodes);
+        Some(batch)
+    }
+
+    /// Attempt to unify resources, returning `true` when unification was successful
+    /// or `false` when resources are still loaned.
+    pub fn unify(&mut self) -> bool {
+        self.resources.unify().is_ok()
+    }
 }
 
 /// An acyclic, directed graph made up of nodes/functions and edges/resources.
@@ -592,6 +918,10 @@ pub struct Graph {
 }
 
 impl Graph {
+    pub fn _resources_mut(&mut self) -> &mut TypeMap {
+        &mut self.resources
+    }
+
     /// Creates a graph node from an [`Fn`] closure.
     ///
     /// A node in the graph is a boxed Rust closure that may do any or all the
@@ -793,6 +1123,12 @@ impl Graph {
                 node.with_barrier(base_barrier + barrier)
             }));
 
+        self
+    }
+
+    /// Proxy for [`Graph::add_subgraph`] with `self` chaining.
+    pub fn with_subgraph(mut self, rhs: Graph) -> Self {
+        self.add_subgraph(rhs);
         self
     }
 
@@ -1051,6 +1387,26 @@ impl Graph {
         self
     }
 
+    /// Reschedule the graph **only if there are unscheduled nodes**.
+    ///
+    /// Returns an error if a schedule cannot be built.
+    pub fn reschedule_if_necessary(&mut self) -> Result<(), GraphError> {
+        if !self.execution.unscheduled.is_empty() {
+            self.reschedule()?;
+        }
+        Ok(())
+    }
+
+    /// Return an iterator over prepared schedule-batches.
+    ///
+    /// The graph should be scheduled ahead of calling this function.
+    pub fn batches<'graph>(&'graph mut self) -> Batches {
+        Batches {
+            schedule: self.execution.schedule.iter_mut(),
+            resources: &mut self.resources,
+        }
+    }
+
     /// Run the graph.
     pub fn run(&mut self) -> Result<(), GraphError> {
         self.run_with_local(missing_local)
@@ -1066,7 +1422,7 @@ impl Graph {
         Output: NodeResults + Any + Send + Sync,
         E: ToString,
     {
-        let mut local = Some(move |resources: Resource| {
+        let mut local = Some(Box::new(move |resources: Resource| {
             let input = *resources.downcast::<Input>().unwrap();
             match (f)(input) {
                 Ok(creates) => Ok(Box::new(creates) as Resource),
@@ -1074,97 +1430,50 @@ impl Graph {
                     error: e.to_string(),
                 }),
             }
-        });
+        })
+            as Box<dyn FnOnce(Resource) -> Result<Resource, GraphError>>);
 
-        if !self.execution.unscheduled.is_empty() {
+        self.reschedule_if_necessary()?;
+
+        let mut got_trimmed = false;
+        let mut batches = self.batches();
+        while let Some(batch) = batches.next_batch() {
+            let batch_result = batch.run(&mut local)?;
+            let did_trim_batch = batch_result.save(true)?;
+            got_trimmed = got_trimmed || did_trim_batch;
+        }
+        if got_trimmed {
             self.reschedule()?;
-        }
-
-        #[derive(Default)]
-        struct Batch<'a, 'b> {
-            inputs: Vec<Resource>,
-            runs: Vec<&'a Box<dyn Fn(Resource) -> Result<Resource, GraphError> + Send + Sync>>,
-            local: Option<(
-                Resource,
-                Box<dyn FnOnce(Resource) -> Result<Resource, GraphError> + 'b>,
-            )>,
-        }
-
-        impl<'a, 'b> Batch<'a, 'b> {
-            #[cfg(feature = "parallel")]
-            fn run(self) -> Vec<Result<Resource, GraphError>> {
-                let Batch {
-                    inputs,
-                    runs,
-                    local,
-                } = self;
-                let mut outputs = inputs
-                    .into_par_iter()
-                    .zip(runs.into_par_iter())
-                    .map(|(input, f)| (f)(input))
-                    .collect::<Vec<_>>();
-                if let Some((input, f)) = local {
-                    outputs.push((f)(input));
-                }
-                outputs
-            }
-
-            #[cfg(not(feature = "parallel"))]
-            fn run(self) -> Vec<Result<Resource, GraphError>> {
-                let Batch {
-                    inputs,
-                    runs,
-                    local,
-                } = self;
-                let mut outputs = inputs
-                    .into_iter()
-                    .zip(runs.into_iter())
-                    .map(|(input, f)| (f)(input))
-                    .collect::<Vec<_>>();
-                if let Some((input, f)) = local {
-                    outputs.push((f)(input));
-                }
-                outputs
-            }
-        }
-
-        for nodes in self.execution.schedule.iter_mut() {
-            let mut batch = Batch::default();
-            for node in nodes.iter() {
-                let input = (node.inner().prepare)(&mut self.resources)?;
-                if let Some(f) = node.inner().run.as_ref() {
-                    batch.inputs.push(input);
-                    batch.runs.push(f);
-                } else {
-                    let f = local.take().context(MissingLocalSnafu)?;
-                    batch.local = Some((
-                        input,
-                        Box::new(f) as Box<dyn FnOnce(Resource) -> Result<Resource, GraphError>>,
-                    ));
-                }
-            }
-
-            for (node, output) in nodes.iter().zip(batch.run()) {
-                let output = output?;
-                (node.inner().save)(output, &mut self.resources)?;
-            }
-
-            self.resources.unify().context(ResourceSnafu)?;
         }
 
         Ok(())
     }
 
     /// Remove a resource from the graph.
+    ///
+    /// Returns an error if the requested resource is loaned, and cannot be removed.
     pub fn remove_resource<T: Any + Send + Sync>(&mut self) -> Result<Option<T>, GraphError> {
         let key = TypeKey::new::<T>();
         if let Some(inner_loan) = self.resources.remove(&key) {
-            let value = inner_loan
-                .into_owned(key.name())
-                .with_context(|_| ResourceSnafu)?;
-            let box_t = value.downcast::<T>().ok().with_context(|| LoanedSnafu)?;
-            Ok(Some(*box_t))
+            match inner_loan.into_owned(key.name()) {
+                Ok(value) => {
+                    // UNWRAP: safe because we got this out as `T`, and it can only be stored
+                    // as `T`
+                    let box_t = value.downcast::<T>().unwrap();
+                    Ok(Some(*box_t))
+                }
+                Err(loan) => {
+                    self.resources.insert(key, loan);
+                    let err = ResourceLoanedSnafu {
+                        type_name: std::any::type_name::<T>(),
+                    }
+                    .build();
+                    log::error!("{err}");
+                    Err(err)
+                }
+            }
         } else {
+            // There is no such resource
             Ok(None)
         }
     }
@@ -1278,6 +1587,21 @@ impl Graph {
             .last()
             .map(|node| node.name().to_string())
     }
+
+    pub fn node_len(&self) -> usize {
+        self.execution.len()
+    }
+
+    /// Pop off the next batch of nodes from the schedule.
+    ///
+    /// The graph must be scheduled first.
+    pub fn take_next_batch_of_nodes(&mut self) -> Option<Vec<Node<Function, TypeKey>>> {
+        if self.execution.schedule.is_empty() {
+            None
+        } else {
+            self.execution.schedule.drain(0..1).next()
+        }
+    }
 }
 
 /// Constructs a [`Graph`] using an intuitive shorthand for node ordering
@@ -1285,7 +1609,7 @@ impl Graph {
 ///
 /// ## Example:
 /// ```rust
-/// use moongraph::{Graph, graph, GraphError, ViewMut};
+/// # use moongraph::{Graph, graph, GraphError, ViewMut};
 ///
 /// fn one(_: ()) -> Result<(), GraphError> {
 ///     log::trace!("one");
@@ -1442,12 +1766,8 @@ mod test {
 
     #[test]
     fn can_derive() {
-        use crate as moongraph;
-
-        #[derive(Debug, Snafu)]
-        enum TestError {}
-
         #[derive(Edges)]
+        #[moongraph(crate = crate)]
         struct Input {
             num_usize: View<usize>,
             num_f32: ViewMut<f32>,
@@ -1456,11 +1776,11 @@ mod test {
 
         type Output = (String, &'static str);
 
-        fn start(_: ()) -> Result<(usize, f32, f64), TestError> {
+        fn start(_: ()) -> Result<(usize, f32, f64), GraphError> {
             Ok((1, 0.0, 10.0))
         }
 
-        fn end(mut input: Input) -> Result<Output, TestError> {
+        fn end(mut input: Input) -> Result<Output, GraphError> {
             *input.num_f32 += *input.num_f64 as f32;
             Ok((
                 format!("{},{},{}", *input.num_usize, *input.num_f32, *input.num_f64),
