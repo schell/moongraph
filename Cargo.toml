@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "crates/moongraph",
-    "crates/moongraph-macros",
+    "crates/moongraph-macros", "crates/moongraph-macros-syntax",
 ]
 
 resolver = "2"

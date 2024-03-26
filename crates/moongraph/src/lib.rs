@@ -15,13 +15,13 @@ use std::{
 
 use broomdog::{Loan, LoanMut};
 use dagga::Dag;
-use snafu::prelude::*;
-
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
+use snafu::prelude::*;
 
 pub use broomdog::{BroomdogErr, TypeKey, TypeMap};
 pub use dagga::{DaggaError, Node};
+#[cfg(feature = "derive")]
 pub use moongraph_macros::Edges;
 
 #[cfg(feature = "tutorial")]
@@ -730,10 +730,14 @@ impl<'graph> BatchResult<'graph> {
     ///
     /// Optionally trim any nodes that report a [`GraphError::TrimNode`] result.
     ///
-    /// Unifies resources.
+    /// Optionally unifies resources.
     ///
     /// Returns `true` if any nodes were trimmed.
-    pub fn save(self, should_trim_nodes: bool) -> Result<bool, GraphError> {
+    pub fn save(
+        self,
+        should_trim_nodes: bool,
+        should_unify_resources: bool,
+    ) -> Result<bool, GraphError> {
         let BatchResult {
             nodes,
             resources,
@@ -768,7 +772,9 @@ impl<'graph> BatchResult<'graph> {
             });
         }
 
-        resources.unify().context(ResourceSnafu)?;
+        if should_unify_resources {
+            resources.unify().context(ResourceSnafu)?;
+        }
 
         Ok(trimmed_any)
     }
@@ -897,6 +903,11 @@ impl<'graph> Batches<'graph> {
     /// or `false` when resources are still loaned.
     pub fn unify(&mut self) -> bool {
         self.resources.unify().is_ok()
+    }
+
+    /// Return the number of batches remaining in the schedule.
+    pub fn len(&self) -> usize {
+        self.schedule.len()
     }
 }
 
@@ -1439,7 +1450,7 @@ impl Graph {
         let mut batches = self.batches();
         while let Some(batch) = batches.next_batch() {
             let batch_result = batch.run(&mut local)?;
-            let did_trim_batch = batch_result.save(true)?;
+            let did_trim_batch = batch_result.save(true, true)?;
             got_trimmed = got_trimmed || did_trim_batch;
         }
         if got_trimmed {

@@ -1,0 +1,14 @@
+[package]
+name = "moongraph-macros-syntax"
+version = "0.1.0"
+edition = "2021"
+description = "Utilities for creating moongraph-macros"
+repository = "https://github.com/schell/moongraph"
+license = "MIT OR Apache-2.0"
+keywords = ["dag", "graph", "rendergraph", "schedule"]
+categories = ["rendering", "game-development", "algorithms"]
+
+[dependencies]
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "2.0", features = ["full"] }
