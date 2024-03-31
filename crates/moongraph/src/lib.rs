@@ -368,7 +368,8 @@ pub trait IsGraphNode<Input, Output> {
 impl<
         Input: Edges + Any + Send + Sync,
         Output: NodeResults + Any + Send + Sync,
-        F: FnMut(Input) -> Result<Output, GraphError> + Send + Sync + 'static,
+        F: FnMut(Input) -> Result<Output, E> + Send + Sync + 'static,
+        E: Into<GraphError>,
     > IsGraphNode<Input, Output> for F
 {
     fn into_node(mut self) -> Node<Function, TypeKey> {
@@ -379,7 +380,7 @@ impl<
             let input = *resources.downcast::<Input>().unwrap();
             match (self)(input) {
                 Ok(creates) => Ok(Box::new(creates)),
-                Err(e) => Err(e),
+                Err(e) => Err(e.into()),
             }
         });
         Node::new(Function {
