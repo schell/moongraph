@@ -15,8 +15,6 @@ use std::{
 
 use broomdog::{Loan, LoanMut};
 use dagga::Dag;
-#[cfg(feature = "parallel")]
-use rayon::prelude::*;
 use snafu::prelude::*;
 
 pub use broomdog::{BroomdogErr, TypeKey, TypeMap};
@@ -29,6 +27,9 @@ mod tutorial_impl;
 
 #[cfg(feature = "tutorial")]
 pub use tutorial_impl::tutorial;
+
+#[cfg(feature = "parallel")]
+pub mod rayon_impl;
 
 /// All errors.
 #[derive(Debug, Snafu)]
@@ -562,19 +563,6 @@ where
     }
 }
 
-impl<'a, S: Send + Sync + 'static, G: Gen<S>> IntoParallelIterator for &'a View<S, G>
-where
-    &'a S: IntoParallelIterator,
-{
-    type Iter = <&'a S as IntoParallelIterator>::Iter;
-
-    type Item = <&'a S as IntoParallelIterator>::Item;
-
-    fn into_par_iter(self) -> Self::Iter {
-        self.deref().into_par_iter()
-    }
-}
-
 /// A mutably borrowed resource that may be created by default.
 ///
 /// Node functions wrap their parameters in [`View`], [`ViewMut`] or [`Move`].
@@ -662,45 +650,6 @@ where
 
     fn into_iter(self) -> Self::IntoIter {
         self.deref().into_iter()
-    }
-}
-
-impl<'a, T: Send + Sync + 'static, G: Gen<T>> IntoParallelIterator for &'a ViewMut<T, G>
-where
-    &'a T: IntoParallelIterator,
-{
-    type Item = <&'a T as IntoParallelIterator>::Item;
-
-    type Iter = <&'a T as IntoParallelIterator>::Iter;
-
-    fn into_par_iter(self) -> Self::Iter {
-        self.deref().into_par_iter()
-    }
-}
-
-impl<'a, T: Send + Sync + 'static, G: Gen<T>> IntoIterator for &'a mut ViewMut<T, G>
-where
-    &'a mut T: IntoIterator,
-{
-    type Item = <<&'a mut T as IntoIterator>::IntoIter as Iterator>::Item;
-
-    type IntoIter = <&'a mut T as IntoIterator>::IntoIter;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.deref_mut().into_iter()
-    }
-}
-
-impl<'a, T: Send + Sync + 'static, G: Gen<T>> IntoParallelIterator for &'a mut ViewMut<T, G>
-where
-    &'a mut T: IntoParallelIterator,
-{
-    type Item = <&'a mut T as IntoParallelIterator>::Item;
-
-    type Iter = <&'a mut T as IntoParallelIterator>::Iter;
-
-    fn into_par_iter(self) -> Self::Iter {
-        self.deref_mut().into_par_iter()
     }
 }
 
@@ -802,6 +751,8 @@ impl<'a> Batch<'a> {
         self,
         local: &mut Option<impl FnOnce(Resource) -> Result<Resource, GraphError>>,
     ) -> Result<BatchResult<'a>, GraphError> {
+        use rayon::prelude::*;
+
         let Batch { nodes, resources } = self;
 
         let mut local_f = None;
@@ -848,9 +799,9 @@ impl<'a> Batch<'a> {
         let mut local_f = None;
         let mut inputs = vec![];
         let mut runs = vec![];
-        for node in nodes.iter() {
+        for node in nodes.iter_mut() {
             let input = (node.inner().prepare)(resources)?;
-            if let Some(f) = node.inner().run.as_ref() {
+            if let Some(f) = node.inner_mut().run.as_mut() {
                 inputs.push(input);
                 runs.push(f);
             } else {
