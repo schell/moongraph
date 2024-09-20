@@ -331,6 +331,7 @@ impl_node_results!(
 fn prepare<Input: Edges + Any + Send + Sync>(
     resources: &mut TypeMap,
 ) -> Result<Resource, GraphError> {
+    log::trace!("preparing input {}", std::any::type_name::<Input>());
     let input = Input::construct(resources)?;
     Ok(Box::new(input))
 }
@@ -339,6 +340,7 @@ fn save<Output: NodeResults + Any + Send + Sync>(
     creates: Resource,
     resources: &mut TypeMap,
 ) -> Result<(), GraphError> {
+    log::trace!("saving output {}", std::any::type_name::<Output>());
     let creates = *creates.downcast::<Output>().unwrap();
     creates.save(resources)
 }
@@ -606,7 +608,7 @@ impl<T: Any + Send + Sync, G: Gen<T>> DerefMut for ViewMut<T, G> {
     }
 }
 
-impl<'a, T: Any + Send + Sync, G: Gen<T>> Edges for ViewMut<T, G> {
+impl<T: Any + Send + Sync, G: Gen<T>> Edges for ViewMut<T, G> {
     fn writes() -> Vec<TypeKey> {
         vec![TypeKey::new::<T>()]
     }
@@ -666,6 +668,11 @@ impl Execution {
     /// Returns the number of nodes.
     pub fn len(&self) -> usize {
         self.unscheduled.len() + self.schedule.iter().map(|batch| batch.len()).sum::<usize>()
+    }
+
+    /// Returns whether this execution is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -760,6 +767,7 @@ impl<'a> Batch<'a> {
         let mut inputs = vec![];
         let mut runs = vec![];
         for node in nodes.iter_mut() {
+            log::trace!("preparing node '{}'", node.name());
             let input = (node.inner().prepare)(resources)?;
             if let Some(f) = node.inner_mut().run.as_mut() {
                 inputs.push(input);
@@ -860,6 +868,11 @@ impl<'graph> Batches<'graph> {
     /// Return the number of batches remaining in the schedule.
     pub fn len(&self) -> usize {
         self.schedule.len()
+    }
+
+    /// Returns `true` if there are no more batches.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -1000,7 +1013,7 @@ impl Graph {
                 },
         } = rhs;
         self.resources
-            .extend(std::mem::take(rhs_resources.deref_mut()).into_iter());
+            .extend(std::mem::take(rhs_resources.deref_mut()));
         let mut unscheduled: HashMap<String, Node<Function, TypeKey>> = HashMap::default();
         let lhs_nodes = std::mem::take(&mut self.execution.unscheduled);
         unscheduled.extend(
@@ -1078,7 +1091,7 @@ impl Graph {
         let base_barrier = self.execution.barrier;
         self.execution.barrier = base_barrier + rhs_barrier;
         self.resources
-            .extend(std::mem::take(rhs_resources.deref_mut()).into_iter());
+            .extend(std::mem::take(rhs_resources.deref_mut()));
         self.execution
             .unscheduled
             .extend(rhs_nodes.into_iter().map(|node| {
@@ -1208,22 +1221,12 @@ impl Graph {
 
     /// Return a reference to the node with the given name, if possible.
     pub fn get_node(&self, name: impl AsRef<str>) -> Option<&Node<Function, TypeKey>> {
-        for node in self.nodes() {
-            if node.name() == name.as_ref() {
-                return Some(node);
-            }
-        }
-        None
+        self.nodes().find(|&node| node.name() == name.as_ref())
     }
 
     /// Return a mutable reference to the node with the given name, if possible.
     pub fn get_node_mut(&mut self, name: impl AsRef<str>) -> Option<&mut Node<Function, TypeKey>> {
-        for node in self.nodes_mut() {
-            if node.name() == name.as_ref() {
-                return Some(node);
-            }
-        }
-        None
+        self.nodes_mut().find(|node| node.name() == name.as_ref())
     }
 
     /// Remove a node from the graph by name.
@@ -1363,7 +1366,7 @@ impl Graph {
     /// Return an iterator over prepared schedule-batches.
     ///
     /// The graph should be scheduled ahead of calling this function.
-    pub fn batches<'graph>(&'graph mut self) -> Batches {
+    pub fn batches(&mut self) -> Batches {
         Batches {
             schedule: self.execution.schedule.iter_mut(),
             resources: &mut self.resources,
@@ -1445,14 +1448,14 @@ impl Graph {
     ///
     /// If the resource _does not_ exist `Ok(None)` will be returned.
     pub fn get_resource<T: Any + Send + Sync>(&self) -> Result<Option<&T>, GraphError> {
-        Ok(self.resources.get_value().context(ResourceSnafu)?)
+        self.resources.get_value().context(ResourceSnafu)
     }
 
     /// Get a mutable reference to a resource in the graph.
     ///
     /// If the resource _does not_ exist `Ok(None)` will be returned.
     pub fn get_resource_mut<T: Any + Send + Sync>(&mut self) -> Result<Option<&mut T>, GraphError> {
-        Ok(self.resources.get_value_mut().context(ResourceSnafu)?)
+        self.resources.get_value_mut().context(ResourceSnafu)
     }
 
     /// Fetch graph edges and visit them with a closure.
@@ -1655,6 +1658,7 @@ mod test {
 
     #[test]
     fn many_inputs_many_outputs() {
+        use crate as moongraph;
         // tests our Edges and NodeResults impl macros
         fn start(_: ()) -> Result<(usize, u32, f32, f64, &'static str, String), GraphError> {
             Ok((0, 0, 0.0, 0.0, "hello", "HELLO".into()))
@@ -1684,15 +1688,18 @@ mod test {
             Ok(())
         }
 
+        #[derive(Edges)]
+        struct EndData(
+            Move<usize>,
+            Move<u32>,
+            Move<f32>,
+            Move<f64>,
+            Move<&'static str>,
+            Move<String>,
+        );
+
         fn end(
-            (nusize, nu32, nf32, nf64, sstatic, sowned): (
-                Move<usize>,
-                Move<u32>,
-                Move<f32>,
-                Move<f64>,
-                Move<&'static str>,
-                Move<String>,
-            ),
+            EndData(nusize, nu32, nf32, nf64, sstatic, sowned): EndData,
         ) -> Result<(bool,), GraphError> {
             assert_eq!(1, *nusize);
             assert_eq!(1, *nu32);
@@ -1764,9 +1771,6 @@ mod test {
     #[test]
     fn can_visit_and_then_borrow() {
         use crate as moongraph;
-
-        #[derive(Debug, Snafu)]
-        enum TestError {}
 
         #[derive(Edges)]
         struct Input {
