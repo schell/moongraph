@@ -113,7 +113,7 @@ pub fn derive_edges(input: DeriveInput, path: syn::Path) -> proc_macro2::TokenSt
 
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
-    let output = quote! {
+    quote! {
         impl #impl_generics #path::Edges for #name #ty_generics #where_clause {
             fn reads() -> Vec<#path::TypeKey> {
                 let mut r = Vec::new();
@@ -143,7 +143,5 @@ pub fn derive_edges(input: DeriveInput, path: syn::Path) -> proc_macro2::TokenSt
                 Ok(#construct_return)
             }
         }
-    };
-
-    output.into()
+    }
 }
