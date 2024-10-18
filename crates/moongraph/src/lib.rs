@@ -85,7 +85,7 @@ pub fn end() -> Result<(), GraphError> {
     Err(GraphError::TrimNode)
 }
 
-/// Returns a result meaning an error occured and the graph cannot recover.
+/// Returns a result meaning an error occurred and the graph cannot recover.
 pub fn err(err: impl std::error::Error + Send + Sync + 'static) -> Result<(), GraphError> {
     Err(GraphError::other(err))
 }
@@ -946,7 +946,7 @@ impl Graph {
     #[deprecated(
         since = "0.3.3",
         note = "Ambiguous name. Replaced by `interleave_subgraph` and `add_subgraph`. Use \
-                Graph::interleave_subgraph instead as a direct replacment."
+                Graph::interleave_subgraph instead as a direct replacement."
     )]
     /// Merge two graphs, preferring the right in cases of key collisions.
     ///
