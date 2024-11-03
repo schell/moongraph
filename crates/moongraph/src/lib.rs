@@ -98,8 +98,8 @@ pub type FnSave = dyn Fn(Resource, &mut TypeMap) -> Result<(), GraphError>;
 /// A function wrapper.
 ///
 /// Wraps a function by moving it into a closure. Before running, the parameters
-/// of the function are constructed from a TypeMap of resources. The results
-/// of the function are packed back into the same TypeMap.
+/// of the function are constructed from a `TypeMap` of resources. The results
+/// of the function are packed back into the same `TypeMap`.
 pub struct Function {
     prepare: Box<FnPrepare>,
     run: Option<Box<FnMutRun>>,
