@@ -682,7 +682,7 @@ pub struct BatchResult<'graph> {
     results: Vec<Result<Resource, GraphError>>,
 }
 
-impl<'graph> BatchResult<'graph> {
+impl BatchResult<'_> {
     /// Save the results of the batch run to the graph.
     ///
     /// Optionally trim any nodes that report a [`GraphError::TrimNode`] result.
